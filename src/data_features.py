@@ -1,8 +1,11 @@
-# 01_data_features.py
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Module 01: Data Loading & Feature Selection
-Handles data Input/Ouput, target construction, and feature selection
+Handles data I/O, target construction, and feature selection
+
+Author: Master Finance Student
+HEC Lausanne - Fall 2025
 """
 
 import pandas as pd
@@ -12,22 +15,16 @@ import warnings
 import sys
 import logging
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
 logger = logging.getLogger(__name__)
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Add project root to path (bkty_ml folder)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # bkty_ml/
 sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from src.config import config
 except ImportError:
-    import config
+    from config import config
 
 
 # ============================================================================
@@ -142,7 +139,7 @@ def load_raw_data(validate: bool = True) -> pd.DataFrame:
     removed = before_dedup - after_dedup
     
     if removed > 0:
-        logger.info(f"✓ Deduplication: removed {removed:,} obs ({removed/before_dedup*100:.1f}%)")
+        logger.info(f"✓ Deduplication: removed {removed:,} obs ({removed/before_dedup*100:.2f}%)")
         logger.info(f"  Final: {after_dedup:,} unique (firm, year) pairs")
     
     if validate:
@@ -176,6 +173,95 @@ def validate_raw_data(df: pd.DataFrame):
         warnings.warn("Data validation warnings:\n" + "\n".join(f"  - {i}" for i in issues))
     else:
         logger.info("✓ Data validation passed")
+
+
+# ============================================================================
+# DATA IMPUTATION & MISSING DATA HANDLING
+# ============================================================================
+
+def impute_missing_data(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Impute missing financial data using forward-fill within company, then median
+    
+    Strategy:
+    1. Forward-fill within each company (by fyear)
+    2. For "active" companies: DROP rows with remaining NaN in critical features
+    3. For "failure" companies: Fill remaining NaN with median (across all companies)
+    4. Backward-fill for companies with NaN at the start
+    
+    Args:
+        df: DataFrame with financial data and status column
+        verbose: Print statistics
+    
+    Returns:
+        DataFrame with imputed missing values
+    """
+    df = df.copy()
+    id_col = config.data.id_col
+    year_col = config.data.year_col
+    status_col = config.data.status_col
+    feature_cols = config.data.feature_cols
+    
+    if verbose:
+        logger.info(f"\n--- Imputing Missing Data ---")
+        total_missing_before = df[feature_cols].isna().sum().sum()
+        logger.info(f"Total missing values: {total_missing_before:,}")
+    
+    # Step 1: Forward-fill within each company
+    if verbose:
+        logger.info(f"\nStep 1: Forward-fill within each company...")
+    
+    df = df.sort_values([id_col, year_col]).reset_index(drop=True)
+    df[feature_cols] = df.groupby(id_col)[feature_cols].fillna(method='ffill')
+    
+    total_after_ffill = df[feature_cols].isna().sum().sum()
+    if verbose:
+        logger.info(f"  After forward-fill: {total_after_ffill:,} missing")
+    
+    # Step 2: Backward-fill (for companies with missing first observation)
+    if verbose:
+        logger.info(f"\nStep 2: Backward-fill within each company...")
+    
+    df[feature_cols] = df.groupby(id_col)[feature_cols].fillna(method='bfill')
+    
+    total_after_bfill = df[feature_cols].isna().sum().sum()
+    if verbose:
+        logger.info(f"  After backward-fill: {total_after_bfill:,} missing")
+    
+    # Step 3: Handle remaining NaN differently for "active" vs "failure" companies
+    if verbose:
+        logger.info(f"\nStep 3: Handle remaining NaN (status-dependent)...")
+    
+    # For "failure" companies: use median
+    if verbose:
+        logger.info(f"  - Failure companies: fill with median")
+    failure_mask = df[status_col] == "failure"
+    medians = df[feature_cols].median()
+    df.loc[failure_mask, feature_cols] = df.loc[failure_mask, feature_cols].fillna(medians)
+    
+    # For "active" companies: drop rows with NaN
+    if verbose:
+        logger.info(f"  - Active companies: drop rows with NaN")
+    
+    before_drop = len(df)
+    active_mask = df[status_col] == "active"
+    df_active = df[active_mask].dropna(subset=feature_cols)
+    df_failure = df[~active_mask]
+    
+    df = pd.concat([df_active, df_failure], ignore_index=True)
+    df = df.sort_values([id_col, year_col]).reset_index(drop=True)
+    
+    after_drop = len(df)
+    
+    if verbose:
+        total_after_impute = df[feature_cols].isna().sum().sum()
+        logger.info(f"\n✓ Imputation complete:")
+        logger.info(f"  Before: {before_drop:,} rows")
+        logger.info(f"  After:  {after_drop:,} rows")
+        logger.info(f"  Removed: {before_drop - after_drop:,} rows ({(before_drop-after_drop)/before_drop*100:.2f}%)")
+        logger.info(f"  Remaining missing values: {total_after_impute:,}")
+    
+    return df
 
 
 # ============================================================================
@@ -233,7 +319,7 @@ def build_target_from_status(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     if verbose:
         n_failures = df[target_col].sum()
         failure_rate = n_failures / len(df) * 100
-        logger.info(f"\n✓ Target variable created:")
+        logger.info(f"\n Target variable created:")
         logger.info(f"  Total observations: {len(df):,}")
         logger.info(f"  Failed next year (target=1): {int(n_failures):,} ({failure_rate:.2f}%)")
         logger.info(f"  Survived (target=0): {len(df) - int(n_failures):,} ({100-failure_rate:.2f}%)")
@@ -313,7 +399,7 @@ def validate_features(df: pd.DataFrame):
     if len(high_missing) > 0:
         logger.warning(f"⚠️  Features with >30% missing:")
         for feat, pct in high_missing.items():
-            logger.warning(f"    {feat}: {pct:.1f}%")
+            logger.warning(f"    {feat}: {pct:.2f}%")
     
     # Zero variance
     zero_var = df[feature_cols].var()
@@ -338,38 +424,56 @@ def save_processed_data(df: pd.DataFrame, filename: str = "dataset_with_features
 
 def run_data_features_pipeline(verbose: bool = True) -> pd.DataFrame:
     """
-    Complete data loading + feature selection pipeline
+    Complete data loading + feature selection + imputation pipeline
+    
+    Steps:
+    1. Load raw CSV data
+    2. Impute missing data (forward-fill, then drop for active / median for failure)
+    3. Build target variable (from status)
+    4. Select features
+    5. Save processed data
     
     Returns:
         DataFrame ready for preprocessing
     """
-    logger.info("\n" + "="*70)
-    logger.info("MODULE 01: DATA LOADING & FEATURE SELECTION")
-    logger.info("="*70)
+    print("\n" + "="*70)
+    print("MODULE 01: DATA LOADING & FEATURE SELECTION")
+    print("="*70)
     
     # Create directories
     ensure_dirs()
     
-    # Load raw data
+    # Step 1: Load raw data
     df_raw = load_raw_data(validate=True)
     
-    # Build target
-    df_with_target = build_target_from_status(df_raw, verbose=verbose)
+    # Step 2: Impute missing data
+    df_imputed = impute_missing_data(df_raw, verbose=verbose)
     
-    # Select features
+    # Step 3: Build target
+    df_with_target = build_target_from_status(df_imputed, verbose=verbose)
+    
+    # Step 4: Select features
     df_features = select_features(df_with_target, validate=True, verbose=verbose)
     
-    # Save
+    # Step 5: Save
     save_processed_data(df_features)
     
-    logger.info("\n" + "="*70)
-    logger.info("MODULE 01 COMPLETED")
-    logger.info("="*70)
+    print("")
+    print("=" * 70)
+    print("MODULE 01 COMPLETED")
+    print("=" * 70)
     
     return df_features
 
 
 if __name__ == "__main__":
+    # Configure logging for standalone execution
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
     df = run_data_features_pipeline(verbose=True)
-    print(f"\n Final dataset shape: {df.shape}")
-    print(f" Target distribution:\n{df[config.data.target_col].value_counts()}")
+    print(f"\nFinal dataset shape: {df.shape}")
+    print(f"Target distribution:\n{df[config.data.target_col].value_counts()}")

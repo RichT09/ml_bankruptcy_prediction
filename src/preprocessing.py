@@ -1,333 +1,347 @@
-# 02_preprocessing.py
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Module 02: Preprocessing
-Data cleaning, train/test split, scaling, SMOTE
+Data cleaning, train/test split, scaling, and SMOTE resampling
 """
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import SMOTE
 import logging
-from pathlib import Path
-import sys
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Add project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
-
 try:
-    from src.config import config
+    from . import config
 except ImportError:
     import config
 
 
-# ============================================================================
-# DATA CLEANING
-# ============================================================================
-
-def clean_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
-    """
-    Clean features: handle missing values, outliers, zero variance
-    
-    Args:
-        df: DataFrame with features
-        verbose: Print statistics
-    
-    Returns:
-        Cleaned DataFrame
-    """
+def clean_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    feature_cols = [f for f in config.data.feature_cols if f in df.columns]
-    
-    if verbose:
-        logger.info("\n--- Feature Cleaning ---")
-        logger.info(f"Initial shape: {df.shape}")
-    
-    # 1. Handle missing values (median imputation)
-    n_missing_before = df[feature_cols].isna().sum().sum()
+    feature_cols = config.FEATURE_COLS
+
     medians = df[feature_cols].median()
     df[feature_cols] = df[feature_cols].fillna(medians)
-    
-    if verbose and n_missing_before > 0:
-        logger.info(f"✓ Imputed {n_missing_before:,} missing values (median)")
-    
-    # 2. Handle outliers (winsorization)
-    if config.preprocessing.outlier_method == "winsorize":
-        lower = df[feature_cols].quantile(config.preprocessing.outlier_lower_pct / 100)
-        upper = df[feature_cols].quantile(config.preprocessing.outlier_upper_pct / 100)
-        df[feature_cols] = df[feature_cols].clip(lower=lower, upper=upper, axis=1)
-        
-        if verbose:
-            logger.info(f"✓ Winsorized outliers ({config.preprocessing.outlier_lower_pct}%, {config.preprocessing.outlier_upper_pct}%)")
-    
-    # 3. Remove zero variance features
+
+    lower = df[feature_cols].quantile(0.01)
+    upper = df[feature_cols].quantile(0.99)
+    df[feature_cols] = df[feature_cols].clip(lower=lower, upper=upper, axis=1)
+
     variances = df[feature_cols].var()
     zero_var = variances[variances == 0].index.tolist()
     if zero_var:
         df = df.drop(columns=zero_var)
-        if verbose:
-            logger.info(f"✓ Removed {len(zero_var)} zero-variance features")
-    
-    # 4. Replace inf values
-    df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
-    df[feature_cols] = df[feature_cols].fillna(medians)
-    
-    if verbose:
-        logger.info(f"Final shape: {df.shape}")
-    
+
     return df
 
 
-# ============================================================================
-# TRAIN/TEST SPLIT
-# ============================================================================
+def time_based_split(df: pd.DataFrame):
+    df_train = df[df[config.YEAR_COL] <= config.SPLIT_YEAR].copy()
+    df_test = df[df[config.YEAR_COL] > config.SPLIT_YEAR].copy()
 
-def time_based_split(df: pd.DataFrame, verbose: bool = True):
-    """
-    Time-based train/test split (no data leakage)
-    
-    Train: years <= split_year
-    Test: years > split_year
-    
-    Args:
-        df: DataFrame with cleaned features
-        verbose: Print statistics
-    
-    Returns:
-        df_train, df_test, X_train, X_test, y_train, y_test
-    """
-    year_col = config.data.year_col
-    target_col = config.data.target_col
-    feature_cols = [f for f in config.data.feature_cols if f in df.columns]
-    
-    # Split
-    df_train = df[df[year_col] <= config.data.split_year].copy()
-    df_test = df[df[year_col] > config.data.split_year].copy()
-    
-    # Extract X, y
-    X_train = df_train[feature_cols]
-    y_train = df_train[target_col].astype(int)
-    
-    X_test = df_test[feature_cols]
-    y_test = df_test[target_col].astype(int)
-    
-    if verbose:
-        logger.info("\n--- Train/Test Split (Time-Based) ---")
-        logger.info(f"Train: {df_train[year_col].min():.0f} → {df_train[year_col].max():.0f}")
-        logger.info(f"  Observations: {len(df_train):,}")
-        logger.info(f"  Failures: {y_train.sum():,} ({y_train.sum()/len(y_train)*100:.2f}%)")
-        
-        logger.info(f"\nTest: {df_test[year_col].min():.0f} → {df_test[year_col].max():.0f}")
-        logger.info(f"  Observations: {len(df_test):,}")
-        logger.info(f"  Failures: {y_test.sum():,} ({y_test.sum()/len(y_test)*100:.2f}%)")
-        
-        logger.info(f"\nFeatures: {len(feature_cols)}")
-    
+    X_train = df_train[config.FEATURE_COLS]
+    y_train = df_train[config.TARGET_COL].astype(int)
+    X_test = df_test[config.FEATURE_COLS]
+    y_test = df_test[config.TARGET_COL].astype(int)
+
     return df_train, df_test, X_train, X_test, y_train, y_test
 
 
-# ============================================================================
-# SCALING
-# ============================================================================
-
-def scale_for_linear_models(X_train, X_test, verbose: bool = True):
-    """
-    Scale features for linear models (LogReg, SVM)
-    
-    Args:
-        X_train: Training features
-        X_test: Test features
-        verbose: Print info
-    
-    Returns:
-        scaler, X_train_scaled, X_test_scaled
-    """
-    method = config.preprocessing.scaling_method
-    
-    if method == "standard":
-        scaler = StandardScaler()
-    elif method == "minmax":
-        scaler = MinMaxScaler()
-    elif method == "robust":
-        scaler = RobustScaler()
-    else:
-        raise ValueError(f"Unknown scaling method: {method}")
-    
+def scale_for_linear_models(X_train, X_test):
+    scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
-    
-    if verbose:
-        logger.info(f"\n--- Scaling ({method}) ---")
-        logger.info(f"✓ Scaler fitted on train set")
-        logger.info(f"  Train scaled: {X_train_scaled.shape}")
-        logger.info(f"  Test scaled: {X_test_scaled.shape}")
-    
     return scaler, X_train_scaled, X_test_scaled
 
 
-# ============================================================================
-# CLASS WEIGHTS
-# ============================================================================
-
-def compute_class_weights(y_train, verbose: bool = True):
+def compute_class_weights(y_train, fp_weight_multiplier=1.0):
     """
-    Compute class weights for imbalanced data
+    Compute class weights for imbalanced classification
+    
+    Formula:
+        1. balanced_weight = n_samples / (n_classes * n_samples_per_class)
+           → With 1% failures: weight[1] ≈ 86x weight[0]
+        
+        2. adjusted_weight[1] = balanced_weight[1] * fp_weight_multiplier
+           → multiplier < 1 reduces positive class weight
+           → This leads to fewer false positives (model less aggressive)
+        
+        3. scale_pos_weight = weight[1] / weight[0]
+           → Used by XGBoost
+    
+    Example with 1% failure rate:
+        - multiplier=1.0  → scale_pos_weight ≈ 86 (fully balanced)
+        - multiplier=0.45 → scale_pos_weight ≈ 39 (fewer FP, lower recall)
     
     Args:
-        y_train: Training target
-        verbose: Print weights
+        y_train: Target labels
+        fp_weight_multiplier: Factor to adjust positive class weight
+                              < 1 = fewer false positives, lower recall
+                              > 1 = more false positives, higher recall
     
     Returns:
-        class_weight_dict, scale_pos_weight (for XGBoost)
+        class_weight_dict: {0: w0, 1: w1} for sklearn models
+        scale_pos_weight: w1/w0 for XGBoost
     """
     classes = np.unique(y_train)
-    weights = compute_class_weight(
-        class_weight="balanced", 
-        classes=classes, 
-        y=y_train
-    )
+    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+    
+    # Adjust positive class weight
+    weights[1] *= fp_weight_multiplier
     
     class_weight_dict = {int(c): float(w) for c, w in zip(classes, weights)}
-    
-    # XGBoost scale_pos_weight
-    n_neg = (y_train == 0).sum()
-    n_pos = (y_train == 1).sum()
-    scale_pos_weight = float(n_neg / n_pos) if n_pos > 0 else 1.0
-    
-    if verbose:
-        logger.info("\n--- Class Weights ---")
-        logger.info(f"Class distribution: {dict(pd.Series(y_train).value_counts())}")
-        logger.info(f"Class weights: {class_weight_dict}")
-        logger.info(f"XGBoost scale_pos_weight: {scale_pos_weight:.4f}")
-    
+    scale_pos_weight = float(weights[1] / weights[0]) if len(classes) == 2 else 1.0
     return class_weight_dict, scale_pos_weight
 
 
-# ============================================================================
-# SMOTE
-# ============================================================================
-
-def apply_smote(X_train, y_train, verbose: bool = True):
+# ============ SMOTE WITH CONTROLLED RATIO ============
+def apply_smote(X_train, y_train, sampling_strategy=0.15, verbose=True):
     """
-    Apply SMOTE oversampling to balance classes
+    SMOTE with controlled ratio (not 50/50)
+    
+    For precision-focused models:
+    - sampling_strategy: enerates synthetic minorities 
+    - Keeps false positive rate lower than 50/50 balance
+    - Better precision while maintaining some recall
     
     Args:
-        X_train: Training features
-        y_train: Training target
+        X_train: Feature matrix
+        y_train: Target labels
+        sampling_strategy: Ratio of minority to majority class (default 0.15 = 15%)
         verbose: Print statistics
     
     Returns:
         X_resampled, y_resampled
     """
-    sm = SMOTE(
-        sampling_strategy= 0.2,  # Minority class to 20% of majority
-        k_neighbors=3,
-        random_state=config.models.random_state
-    )
+    if verbose:
+        n_before = len(y_train)
+        n_fail_before = y_train.sum()
+        logger.info(f"Before: {n_before:,} samples | {n_fail_before} failures ({n_fail_before/n_before*100:.2f}%)")
     
+    sm = SMOTE(
+        sampling_strategy=sampling_strategy,  # Key parameter: not 'auto' (50/50)
+        k_neighbors=5,
+        random_state=config.RANDOM_STATE
+    )
     X_res, y_res = sm.fit_resample(X_train, y_train)
     
     if verbose:
-        logger.info("\n--- SMOTE Oversampling ---")
-        logger.info(f"Before SMOTE: {X_train.shape[0]:,} samples")
-        logger.info(f"  Class 0: {(y_train == 0).sum():,}")
-        logger.info(f"  Class 1: {(y_train == 1).sum():,}")
-        
-        logger.info(f"\nAfter SMOTE: {X_res.shape[0]:,} samples")
-        logger.info(f"  Class 0: {(y_res == 0).sum():,}")
-        logger.info(f"  Class 1: {(y_res == 1).sum():,}")
+        n_after = len(y_res)
+        n_fail_after = y_res.sum()
+        fail_ratio = n_fail_after / n_after * 100
+        logger.info(f"After:  {n_after:,} samples | {n_fail_after} failures ({fail_ratio:.2f}%)")
+        logger.info(f"Added {n_after - n_before:,} synthetic samples")
+        logger.info(f"Class ratio: {sampling_strategy*100:.2f}% minority")
     
     return X_res, y_res
 
 
-# ============================================================================
-# SAVE PREPROCESSED DATA
-# ============================================================================
-
-def save_preprocessed_data(df_clean, scaler, class_weights, scale_pos_weight):
-    """Save cleaned data and preprocessing objects"""
-    import pickle
-    
-    # Save cleaned dataset
-    out_csv = config.data_dir / "dataset_clean.csv"
-    df_clean.to_csv(out_csv, index=False)
-    logger.info(f"\n✓ Saved cleaned dataset: {out_csv}")
-    
-    # Save scaler
-    scaler_path = config.models_dir / "scaler.pkl"
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    logger.info(f"✓ Saved scaler: {scaler_path}")
-    
-    # Save class weights
-    weights_path = config.models_dir / "class_weights.pkl"
-    with open(weights_path, 'wb') as f:
-        pickle.dump({
-            'class_weights': class_weights,
-            'scale_pos_weight': scale_pos_weight
-        }, f)
-    logger.info(f"✓ Saved class weights: {weights_path}")
-
-
-# ============================================================================
-# MAIN PIPELINE
-# ============================================================================
-
-def run_preprocessing_pipeline(df_features: pd.DataFrame, verbose: bool = True):
+def generate_preprocessing_summary(
+    n_raw: int,
+    n_fail_raw: int,
+    n_train: int,
+    n_fail_train: int,
+    n_test: int,
+    n_fail_test: int,
+    n_smote: int = None,
+    n_fail_smote: int = None,
+    output_dir=None
+) -> pd.DataFrame:
     """
-    Complete preprocessing pipeline
+    Generate a summary table tracking data transformation at each step.
+    
+    This provides full transparency for the thesis report.
     
     Args:
-        df_features: DataFrame from module 01
+        n_raw: Total samples in raw dataset
+        n_fail_raw: Failures in raw dataset
+        n_train: Training samples
+        n_fail_train: Training failures
+        n_test: Test samples
+        n_fail_test: Test failures
+        n_smote: Samples after SMOTE (optional)
+        n_fail_smote: Failures after SMOTE (optional)
+        output_dir: Directory to save CSV (optional)
+    
+    Returns:
+        DataFrame with transformation summary
+    """
+    rows = [
+        {
+            'Step': 'Data',
+            'n_samples': n_raw,
+            'n_failures': n_fail_raw,
+            'failure_rate': n_fail_raw / n_raw * 100 if n_raw > 0 else 0
+        },
+        {
+            'Step': 'Train Set',
+            'n_samples': n_train,
+            'n_failures': n_fail_train,
+            'failure_rate': n_fail_train / n_train * 100 if n_train > 0 else 0
+        }
+    ]
+    
+    # SMOTE row comes after Train Set, before Test Set
+    if n_smote is not None:
+        rows.append({
+            'Step': 'After SMOTE (Train)',
+            'n_samples': n_smote,
+            'n_failures': n_fail_smote,
+            'failure_rate': n_fail_smote / n_smote * 100 if n_smote > 0 else 0
+        })
+    
+    # Test Set is always last
+    rows.append({
+        'Step': 'Test Set',
+        'n_samples': n_test,
+        'n_failures': n_fail_test,
+        'failure_rate': n_fail_test / n_test * 100 if n_test > 0 else 0
+    })
+    
+    df_summary = pd.DataFrame(rows)
+    df_summary['failure_rate'] = df_summary['failure_rate'].round(2)
+    
+    # Save to CSV if output_dir provided
+    if output_dir is not None:
+        csv_path = output_dir / "preprocessing_summary.csv"
+        df_summary.to_csv(csv_path, index=False)
+        # Note: save confirmation logged after table display
+    
+    return df_summary, csv_path if output_dir else None
+
+
+# ============ pipeline ============
+
+def run_preprocessing_pipeline(df, verbose=True):
+    """
+    Complete preprocessing pipeline -
+    
+    Strategy for improving precision :
+    1. Clean features + handle outliers
+    2. Split by time
+    3. Scale features
+    4. Compute class weights with FP penalty (base models)
+    5. Apply SMOTE (tuned models)
+    
+    Returns:
+        Dictionary with both base and tuned data for model comparison
+    
+    Args:
+        df: DataFrame with features
         verbose: Print progress
     
     Returns:
         Dictionary with all preprocessed data
     """
-    logger.info("\n" + "="*70)
-    logger.info("MODULE 02: PREPROCESSING")
-    logger.info("="*70)
+    if verbose:
+        print("")
+        print("=" * 70)
+        print("MODULE 02: PREPROCESSING")
+        print("=" * 70)
     
-    # 1. Clean features
-    df_clean = clean_features(df_features, verbose=verbose)
+    # Step 1: Clean features
+    if verbose:
+        logger.info("--- Cleaning Features ---")
+    df_clean = clean_features(df)
+    if verbose:
+        logger.info(f"Cleaned dataset: {df_clean.shape}")
     
-    # 2. Train/test split
-    df_train, df_test, X_train, X_test, y_train, y_test = time_based_split(
-        df_clean, verbose=verbose
+    # Save cleaned dataset
+    out_path = config.DATA_DIR / "dataset_clean.csv"
+    df_clean.to_csv(out_path, index=False)
+    if verbose:
+        logger.info(f"Saved: {out_path}")
+    
+    # Step 2: Train/Test Split
+    if verbose:
+        logger.info("--- Train/Test Split (Time-Based) ---")
+    df_train, df_test, X_train, X_test, y_train, y_test = time_based_split(df_clean)
+    
+    if verbose:
+        logger.info(f"Train: {df_train[config.YEAR_COL].min():.0f} -> {df_train[config.YEAR_COL].max():.0f}")
+        logger.info(f"  Observations: {len(df_train):,}")
+        logger.info(f"  Failures: {y_train.sum():,} ({y_train.sum()/len(df_train)*100:.2f}%)")
+        logger.info(f"Test:  {df_test[config.YEAR_COL].min():.0f} -> {df_test[config.YEAR_COL].max():.0f}")
+        logger.info(f"  Observations: {len(df_test):,}")
+        logger.info(f"  Failures: {y_test.sum():,} ({y_test.sum()/len(df_test)*100:.2f}%)")
+    
+    # Step 3: Scaling (BEFORE SMOTE to avoid data leakage)
+    if verbose:
+        logger.info("--- Scaling Features ---")
+    scaler, X_train_scaled, X_test_scaled = scale_for_linear_models(X_train, X_test)
+    if verbose:
+        logger.info(f"Scaled features: {X_train_scaled.shape}")
+    
+    # Step 4: Class Weights
+    if verbose:
+        logger.info(f"--- Computing Class Weights (FP Penalty = {config.config.models.fp_weight_multiplier}x) ---")
+    class_weights, scale_pos_weight = compute_class_weights(
+        y_train, 
+        fp_weight_multiplier=config.config.models.fp_weight_multiplier
     )
+    if verbose:
+        logger.info(f"LR/RF: class_weight = {{0: {class_weights[0]:.2f}, 1: {class_weights[1]:.2f}}}")
+        logger.info(f"XGB:   scale_pos_weight = {scale_pos_weight:.2f}")
+        logger.info(f"→ All models: positive class weighted {scale_pos_weight:.2f}x higher")
     
-    # 3. Scaling (for LogReg & SVM)
-    scaler, X_train_scaled, X_test_scaled = scale_for_linear_models(
-        X_train, X_test, verbose=verbose
-    )
-    
-    # 4. Class weights
-    class_weights, scale_pos_weight = compute_class_weights(y_train, verbose=verbose)
-    
-    # 5. SMOTE (optional)
+    # Step 5: SMOTE with controlled ratio (from config)
     X_train_smote = None
     X_train_smote_scaled = None
     y_train_smote = None
     
-    if config.models.use_smote:
-        X_train_smote, y_train_smote = apply_smote(X_train, y_train, verbose=verbose)
+    if config.USE_SMOTE:
+        smote_ratio = config.config.models.smote_ratio_tuned
+        if verbose:
+            logger.info(f"--- Applying SMOTE ({smote_ratio*100:.2f}% ratio) ---")
+        
+        X_train_smote, y_train_smote = apply_smote(
+            X_train, y_train, 
+            sampling_strategy=smote_ratio,
+            verbose=verbose
+        )
         X_train_smote_scaled = scaler.transform(X_train_smote)
-        logger.info("✓ SMOTE applied and scaled")
+        
+        if verbose:
+            logger.info(f"After SMOTE: {len(y_train_smote):,} samples")
+            logger.info(f"  Ratio: {y_train_smote.sum() / len(y_train_smote) * 100:.2f}% failures")
     
-    # 6. Save
-    save_preprocessed_data(df_clean, scaler, class_weights, scale_pos_weight)
+    if verbose:
+        smote_pct = config.config.models.smote_ratio_tuned * 100
+        print("")
+        print("=" * 70)
+        print("MODULE 02 COMPLETED")
+        print("=" * 70)
+        logger.info("Strategy Summary:")
+        logger.info("   BASE MODELS:  Unsampled data + class weight (imbalanced data)")
+        logger.info(f"   TUNED MODELS: Optimized hyperparameters + SMOTE {smote_pct:.2f}% + class weight")
     
-    logger.info("\n" + "="*70)
-    logger.info("✅ MODULE 02 COMPLETED")
-    logger.info("="*70)
+    # Generate preprocessing summary table (for thesis transparency)
+    n_raw = len(df)
+    n_fail_raw = int(df[config.TARGET_COL].sum())
     
+    summary_df, csv_path = generate_preprocessing_summary(
+        n_raw=n_raw,
+        n_fail_raw=n_fail_raw,
+        n_train=len(y_train),
+        n_fail_train=int(y_train.sum()),
+        n_test=len(y_test),
+        n_fail_test=int(y_test.sum()),
+        n_smote=len(y_train_smote) if y_train_smote is not None else None,
+        n_fail_smote=int(y_train_smote.sum()) if y_train_smote is not None else None,
+        output_dir=config.DATA_DIR
+    )
+    
+    if verbose:
+        logger.info("Data Transformation Summary:")
+        print(f"{summary_df.to_string(index=False)}")
+        if csv_path:
+            logger.info(f"✓ Preprocessing summary saved: {csv_path}")
+    
+    # Return dictionary compatible with main.py
     return {
         'df_clean': df_clean,
         'df_train': df_train,
@@ -338,30 +352,39 @@ def run_preprocessing_pipeline(df_features: pd.DataFrame, verbose: bool = True):
         'y_test': y_test,
         'X_train_scaled': X_train_scaled,
         'X_test_scaled': X_test_scaled,
-        'X_train_smote': X_train_smote,
-        'X_train_smote_scaled': X_train_smote_scaled,
-        'y_train_smote': y_train_smote,
         'scaler': scaler,
         'class_weights': class_weights,
         'scale_pos_weight': scale_pos_weight,
+        'X_train_smote': X_train_smote,
+        'X_train_smote_scaled': X_train_smote_scaled,
+        'y_train_smote': y_train_smote,
     }
 
 
-if __name__ == "__main__":
-    # Load data from module 01
-    df_path = config.data_dir / "dataset_with_features.csv"
-    if not df_path.exists():
-        logger.error(f"❌ {df_path} not found. Run module 01 first.")
-        sys.exit(1)
+def main():
+    """
+    Run preprocessing pipeline standalone
+    """
+    # Configure logging for standalone execution
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
     
-    df = pd.read_csv(df_path)
-    logger.info(f"Loaded dataset: {df.shape}")
+    # Load dataset from Module 01
+    path = config.DATA_DIR / "dataset_with_features.csv"
+    if not path.exists():
+        logger.error(f"File not found: {path}")
+        logger.error("Run Module 01 (data_features.py) first.")
+        return
     
-    # Run preprocessing
+    df = pd.read_csv(path)
+    logger.info(f"Loaded dataset_with_features: {df.shape}")
+    
+    # Run full preprocessing pipeline
     data = run_preprocessing_pipeline(df, verbose=True)
-    
-    print(f"\n📊 Preprocessing complete!")
-    print(f"  Train: {data['X_train'].shape}")
-    print(f"  Test: {data['X_test'].shape}")
-    if data['X_train_smote'] is not None:
-        print(f"  Train (SMOTE): {data['X_train_smote'].shape}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,4 +1,8 @@
-# 00_congig.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Configuration Module - Enhanced for Bankruptcy Prediction
+"""
 
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -9,18 +13,19 @@ from typing import List, Dict, Any
 # PATHS
 # ============================================================================
 
-BASE_DIR = Path(__file__).resolve().parents[2]  # bkty_ml parent
-RAW_DATA_PATH = BASE_DIR / "us-bkty-final.csv"
-PROJECT_DIR = Path(__file__).resolve().parents[1]  # bkty_ml/
+BASE_DIR = Path(__file__).resolve().parents[1]  # project-tschumi/
+RAW_DATA_PATH = BASE_DIR / "data" / "us-bkty-final.csv"
+PROJECT_DIR = Path(__file__).resolve().parents[1]  # project-tschumi/
 
 DATA_DIR = PROJECT_DIR / "data"
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 MODELS_DIR = OUTPUT_DIR / "models"
-METRICS_DIR = OUTPUT_DIR / "metrics"
+LOGS_DIR = OUTPUT_DIR / "logs"
 PLOTS_DIR = OUTPUT_DIR / "plots"
+REPORTS_DIR = OUTPUT_DIR / "reports"
 
 # Create directories
-for dir_path in [DATA_DIR, OUTPUT_DIR, MODELS_DIR, METRICS_DIR, PLOTS_DIR]:
+for dir_path in [DATA_DIR, OUTPUT_DIR, MODELS_DIR, LOGS_DIR, PLOTS_DIR, REPORTS_DIR]:
     dir_path.mkdir(exist_ok=True, parents=True)
 
 
@@ -103,10 +108,23 @@ class ModelConfig:
     """Model configuration - Base and Tuned versions"""
     
     random_state: int = 42
-    use_smote: bool = True
+    use_smote: bool = True  
     n_jobs: int = -1
     
+    # Key hyperparameters (centralized here, used in preprocessing/models)
+    smote_ratio_tuned: float = 0.025      # minority ratio for tuned models
+    rfe_n_features: int = 20             # number of features to keep after RFE
+
+        # Class weight adjustment for XGBoost
+    # Formula: scale_pos_weight = (n_neg / n_pos) * fp_weight_multiplier
+    # With ~1% failure rate: n_neg/n_pos ≈ 86
+    # - multiplier = 1.0  → scale_pos_weight ≈ 86 (fully balanced)
+    # - multiplier = 0.45 → scale_pos_weight ≈ 39 (reduce FP penalty)
+    # - multiplier < 1    → less aggressive on minority class = fewer false positives
+    fp_weight_multiplier: float = 0.45
+    
     # ==================== LOGISTIC REGRESSION ====================
+    # BASE: Fixed hyperparameters, no tuning
     logreg_base: Dict[str, Any] = field(default_factory=lambda: {
         'max_iter': 1000,
         'class_weight': 'balanced',
@@ -115,56 +133,58 @@ class ModelConfig:
         'C': 1.0,
         'random_state': 42,
     })
-    
+
+    # TUNED: Default hyperparameters before RandomizedSearchCV optimization
     logreg_tuned: Dict[str, Any] = field(default_factory=lambda: {
         'max_iter': 2000,
         'class_weight': 'balanced',
-        'solver': 'saga',  # Better for large datasets
-        'penalty': 'elasticnet',
-        'C': 0.5,
-        'l1_ratio': 0.5,  # Elastic net mixing
+        'solver': 'lbfgs',
+        'penalty': 'l2',
+        'C': 1.0,
         'random_state': 42,
     })
     
     logreg_param_grid: Dict[str, List] = field(default_factory=lambda: {
-        'C': [0.1, 0.5, 1.0, 2.0],
-        'penalty': ['l1', 'l2', 'elasticnet'],
-        'l1_ratio': [0.3, 0.5, 0.7],
-        'solver': ['saga'],
+        'C': [0.5, 1.0, 2.0],
+        'penalty': ['l2'],
+        'solver': ['lbfgs'],
     })
     
     # ==================== RANDOM FOREST ====================
+    # BASE: Fixed hyperparameters, no tuning
+    # NOTE: class_weight is passed dynamically from preprocessing (same as LR/XGB)
     rf_base: Dict[str, Any] = field(default_factory=lambda: {
         'n_estimators': 300,
         'max_depth': 10,
         'min_samples_split': 20,
         'min_samples_leaf': 10,
-        'class_weight': 'balanced_subsample',
         'max_features': 'sqrt',
         'random_state': 42,
         'n_jobs': -1,
     })
     
+    # TUNED: Default hyperparameters before RandomizedSearchCV optimization
+    # NOTE: class_weight is passed dynamically from preprocessing (same as LR/XGB)
     rf_tuned: Dict[str, Any] = field(default_factory=lambda: {
-        'n_estimators': 500,
-        'max_depth': 15,
-        'min_samples_split': 10,
-        'min_samples_leaf': 5,
-        'class_weight': 'balanced_subsample',
+        'n_estimators': 300,
+        'max_depth': 10,
+        'min_samples_split': 15,
+        'min_samples_leaf': 8,
         'max_features': 'sqrt',
-        'min_impurity_decrease': 0.0001,
+        'min_impurity_decrease': 0.0005,
         'random_state': 42,
         'n_jobs': -1,
     })
     
     rf_param_grid: Dict[str, List] = field(default_factory=lambda: {
-        'n_estimators': [300, 500, 700],
-        'max_depth': [10, 15, 20],
-        'min_samples_split': [5, 10, 20],
-        'min_samples_leaf': [2, 5, 10],
+        'n_estimators': [150, 250],
+        'max_depth': [5, 8, 10],       
+        'min_samples_split': [10, 20, 30],
+        'min_samples_leaf': [5, 10, 15],
     })
     
     # ==================== XGBOOST ====================
+    # BASE: Fixed hyperparameters, no tuning
     xgb_base: Dict[str, Any] = field(default_factory=lambda: {
         'n_estimators': 100,
         'max_depth': 3,
@@ -180,54 +200,29 @@ class ModelConfig:
         'eval_metric': 'logloss',
     })
     
+    # TUNED: Default hyperparameters before RandomizedSearchCV optimization
     xgb_tuned: Dict[str, Any] = field(default_factory=lambda: {
-        'n_estimators': 500,
-        'max_depth': 5,
+        'n_estimators': 200,
+        'max_depth': 4,
         'learning_rate': 0.05,
-        'subsample': 0.7,
-        'colsample_bytree': 0.7,
-        'min_child_weight': 5,
-        'reg_alpha': 0.1,
-        'reg_lambda': 2.0,
-        'gamma': 0.1,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_weight': 3,
+        'reg_alpha': 0.05,
+        'reg_lambda': 1.0,
+        'gamma': 0.05,
         'random_state': 42,
         'n_jobs': -1,
         'eval_metric': 'logloss',
     })
     
     xgb_param_grid: Dict[str, List] = field(default_factory=lambda: {
-        'n_estimators': [300, 500],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.05, 0.1],
-        'subsample': [0.7, 0.8],
-        'colsample_bytree': [0.7, 0.8],
+        'n_estimators': [150, 200],
+        'max_depth': [3, 4, 6],
+        'learning_rate': [0.03, 0.05, 0.1],
         'min_child_weight': [3, 5, 7],
-        'gamma': [0, 0.1, 0.2],
-    })
-    
-    # ==================== SVM ====================
-    svm_base: Dict[str, Any] = field(default_factory=lambda: {
-        'kernel': 'rbf',
-        'C': 1.0,
-        'gamma': 'scale',
-        'class_weight': 'balanced',
-        'probability': True,
-        'random_state': 42,
-    })
-    
-    svm_tuned: Dict[str, Any] = field(default_factory=lambda: {
-        'kernel': 'rbf',
-        'C': 10.0,
-        'gamma': 0.01,
-        'class_weight': 'balanced',
-        'probability': True,
-        'random_state': 42,
-    })
-    
-    svm_param_grid: Dict[str, List] = field(default_factory=lambda: {
-        'C': [0.1, 1.0, 10.0, 100.0],
-        'gamma': [0.001, 0.01, 0.1, 'scale'],
-        'kernel': ['rbf', 'poly'],
+        'subsample': [0.7, 0.8, 1.0],
+        'colsample_bytree': [0.6, 0.8, 1.0],
     })
 
 
@@ -246,7 +241,7 @@ class EvaluationConfig:
     # SHAP analysis
     enable_shap: bool = True
     shap_sample_size: int = 2000
-    shap_top_features: int = 20
+    shap_top_features: int = 10
     
     # Visualization
     figure_dpi: int = 150
@@ -272,8 +267,10 @@ class Config:
         self.data_dir = DATA_DIR
         self.output_dir = OUTPUT_DIR
         self.models_dir = MODELS_DIR
-        self.metrics_dir = METRICS_DIR
+        self.logs_dir = LOGS_DIR
+        self.metrics_dir = LOGS_DIR  # Alias for backward compatibility
         self.plots_dir = PLOTS_DIR
+        self.reports_dir = REPORTS_DIR
     
     def __repr__(self):
         return (
@@ -292,15 +289,17 @@ class Config:
 config = Config()
 
 
-# ============================================================================
-# CONVENIENCE EXPORTS (for backward compatibility)
-# ============================================================================
+# ----------------------------------------------------------------------------
+# CONVENIENCE EXPORTS
+# ----------------------------------------------------------------------------
 
 # Paths
 DATA_DIR = config.data_dir
 PLOTS_DIR = config.plots_dir
 MODELS_DIR = config.models_dir
-METRICS_DIR = config.metrics_dir
+LOGS_DIR = config.logs_dir
+METRICS_DIR = config.logs_dir  # Alias for backward compatibility
+REPORTS_DIR = config.reports_dir
 
 # Data
 YEAR_COL = config.data.year_col
@@ -320,6 +319,6 @@ if __name__ == "__main__":
     print("="*60)
     print(config)
     print(f"\n Data path: {config.raw_data_path}")
-    print(f"Features: {len(config.data.feature_cols)}")
-    print(f"Target: {config.data.target_col}")
+    print(f" Features: {len(config.data.feature_cols)}")
+    print(f" Target: {config.data.target_col}")
     print("\n Config loaded successfully!")

@@ -19,8 +19,6 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-# Setup
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -71,7 +69,7 @@ def plot_target_distribution(df: pd.DataFrame, output_path: Path):
             fontweight='bold'
         )
     
-    # Améliorer la grille
+    # Improve grid styling
     ax.grid(axis='y', alpha=0.3, linestyle='--')
     ax.set_axisbelow(True)
     
@@ -121,23 +119,36 @@ def plot_temporal_distribution(df: pd.DataFrame, output_path: Path):
     logger.info(f"  ✓ {output_path.name}")
 
 
-def plot_correlation_heatmap(df: pd.DataFrame, output_path: Path):
+def plot_correlation_heatmap(df: pd.DataFrame, output_path: Path, selected_features: list = None):
     """
     Plot correlation heatmap - Version triangulaire
+    Uses RFE selected features if provided, otherwise uses config.data.feature_cols
     """
-    feature_cols = [f for f in config.data.feature_cols if f in df.columns][:20]
+    if selected_features is not None:
+        feature_cols = [f for f in selected_features if f in df.columns]
+    else:
+        # Use config for number of features
+        n_features = config.models.rfe_n_features
+        feature_cols = [f for f in config.data.feature_cols if f in df.columns][:n_features]
     
-    corr = df[feature_cols].corr()
+    # Prepare data (convert to numeric)
+    X = df[feature_cols].copy()
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors='coerce')
+    X = X.fillna(0)
+    
+    corr = X.corr()
     
     fig, ax = plt.subplots(figsize=(16, 14))
     
-        mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+    # Upper triangular mask (keep lower + diagonal)
+    mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
     
     cmap = sns.diverging_palette(250, 10, as_cmap=True)
     
     sns.heatmap(
         corr,
-        mask=mask,  
+        mask=mask,  # Mask upper triangle only
         cmap=cmap,
         center=0,
         square=True,
@@ -153,52 +164,13 @@ def plot_correlation_heatmap(df: pd.DataFrame, output_path: Path):
     
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=9)
     ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=9)
-    ax.set_title('Feature Correlation Heatmap (Top 20)', 
+    ax.set_title('Feature Correlation Heatmap (20 RFE Features)', 
                  fontsize=16, fontweight='bold', pad=20)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     logger.info(f"  ✓ {output_path.name}")
-
-
-# def plot_feature_distributions_by_target(df: pd.DataFrame, output_path: Path, n_features: int = 12):
-#     """
-#     Plot distribution of top features by target class
-#     """
-#     target_col = config.data.target_col
-#     feature_cols = [f for f in config.data.feature_cols if f in df.columns][:n_features]
-    
-#     n_cols = 3
-#     n_rows = (n_features + n_cols - 1) // n_cols
-    
-#     fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 4*n_rows))
-#     axes = axes.flatten() if n_features > 1 else [axes]
-    
-#     for idx, feat in enumerate(feature_cols):
-#         ax = axes[idx]
-        
-#         df_survived = df[df[target_col] == 0][feat].dropna()
-#         df_failed = df[df[target_col] == 1][feat].dropna()
-        
-#         ax.hist(df_survived, bins=30, alpha=0.6, label='Survived', color='green', density=True)
-#         ax.hist(df_failed, bins=30, alpha=0.6, label='Failed', color='red', density=True)
-        
-#         ax.set_xlabel(feat, fontsize=10)
-#         ax.set_ylabel('Density', fontsize=10)
-#         ax.set_title(f'{feat}', fontsize=11, fontweight='bold')
-#         ax.legend(fontsize=9)
-#         ax.grid(alpha=0.3)
-    
-#     # Hide extra subplots
-#     for idx in range(n_features, len(axes)):
-#         fig.delaxes(axes[idx])
-#     
-#     plt.suptitle('Feature Distributions by Target Class', fontsize=14, fontweight='bold', y=1.00)
-#     plt.tight_layout()
-#     plt.savefig(output_path, dpi=150, bbox_inches='tight')
-#     plt.close()
-#     logger.info(f"  ✓ {output_path.name}")
 
 
 # ============================================================================
@@ -269,264 +241,738 @@ def plot_logistic_regression_coef(model, feature_names: list, output_path: Path,
 
 
 # ============================================================================
-# SHAP ANALYSIS
+# SHAP ANALYSIS - FIXED VERSION
 # ============================================================================
 
-def shap_analysis_tree_model(
+def prepare_shap_data(df: pd.DataFrame, selected_features: list) -> pd.DataFrame:
+    """
+    Prepare data for SHAP: select features and convert to float64.
+    Handles strings in scientific notation (e.g., "3.1894583E-1").
+    
+    Args:
+        df: Full DataFrame (may contain non-numeric columns)
+        selected_features: List of RFE selected features
+    
+    Returns:
+        DataFrame with only the required numeric features (float64)
+    """
+    # Sélectionner uniquement les features existantes
+    available_features = [f for f in selected_features if f in df.columns]
+    X = df[available_features].copy()
+    
+    # Convertir toutes les colonnes en numérique (gère les strings scientifiques)
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors='coerce')
+    
+    # Remplacer NaN par 0
+    X = X.fillna(0)
+    
+    # S'assurer que tout est en float64
+    X = X.astype(np.float64)
+    
+    return X
+
+
+def shap_summary_tree_model(
     model, 
-    X_sample: pd.DataFrame, 
+    X_shap: pd.DataFrame, 
     model_name: str,
     output_dir: Path,
     verbose: bool = True
 ):
     """
-    SHAP analysis for tree-based models (RF, XGBoost)
+    SHAP Summary Plot pour modèles tree-based (RF, XGBoost).
+    Génère UN SEUL plot (beeswarm summary).
     """
     if verbose:
-        logger.info(f"\n  → SHAP analysis: {model_name}")
+        logger.info(f"\n  → SHAP Summary: {model_name}")
     
     try:
-        # Pour XGBoost, utiliser un workaround
-        if 'XGBoost' in model_name:
-            # Méthode alternative : Kernel explainer (plus lent mais fonctionne)
-            import warnings
-            warnings.filterwarnings('ignore')
-            
-            # Utiliser un petit échantillon pour Kernel (sinon trop lent)
-            X_sample_small = X_sample.sample(min(500, len(X_sample)), random_state=42)
-            explainer = shap.KernelExplainer(
-                model.predict_proba, 
-                X_sample_small,
-                link="logit"
-            )
-            shap_values = explainer.shap_values(X_sample_small)
-            
-            # Si binary classification, prendre classe positive
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]
-            
-            X_for_plot = X_sample_small
-            
+        # Limiter l'échantillon pour la vitesse
+        n_sample = min(500, len(X_shap))
+        if len(X_shap) > n_sample:
+            X_sample = X_shap.sample(n=n_sample, random_state=42)
         else:
-            # RandomForest : méthode normale
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_sample)
-            
-            if isinstance(shap_values, list) and len(shap_values) == 2:
-                shap_values = shap_values[1]
-            
-            X_for_plot = X_sample
+            X_sample = X_shap.copy()
         
-        # 1. Summary plot (beeswarm)
-        plt.figure()
-        shap.summary_plot(shap_values, X_for_plot, show=False, max_display=20)
-        plt.title(f'{model_name} - SHAP Summary', fontsize=14, fontweight='bold', pad=20)
+        # Convertir en numpy array float64 (CRITICAL)
+        X_array = X_sample.values.astype(np.float64)
+        feature_names = list(X_sample.columns)
+        
+        # Different approach for XGBoost vs RandomForest
+        if 'XGBoost' in model_name:
+            # XGBoost: use shap.Explainer with predict_proba (workaround for string conversion bug)
+            background = X_array[:min(100, len(X_array))]
+            explainer = shap.Explainer(model.predict_proba, background)
+            shap_values_obj = explainer(X_array)
+            # Get class 1 (bankruptcy) SHAP values
+            shap_values = shap_values_obj.values[:, :, 1]
+        else:
+            # RandomForest: use TreeExplainer
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_array)
+            
+            # Handle different SHAP output formats:
+            # - RandomForest: returns 3D array (n_samples, n_features, n_classes) or list
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]  # Class 1 (bankruptcy)
+            elif len(shap_values.shape) == 3:
+                shap_values = shap_values[:, :, 1]  # Class 1 (bankruptcy)
+        
+        # Verify dimensions match
+        if shap_values.shape != X_array.shape:
+            raise ValueError(f"Shape mismatch: SHAP {shap_values.shape} vs Data {X_array.shape}")
+        
+        # Summary Plot (beeswarm) - ONLY ONE PLOT
+        plt.figure(figsize=(12, 10))
+        shap.summary_plot(
+            shap_values, 
+            X_array, 
+            feature_names=feature_names,
+            show=False, 
+            max_display=20
+        )
+        plt.title(f'{model_name} - SHAP Summary Plot', fontsize=14, fontweight='bold', pad=20)
         plt.tight_layout()
         plt.savefig(output_dir / f"shap_summary_{model_name}.png", dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # 2. Bar plot (mean absolute SHAP)
-        plt.figure()
-        shap.summary_plot(shap_values, X_for_plot, plot_type="bar", show=False, max_display=20)
-        plt.title(f'{model_name} - Feature Importance (SHAP)', fontsize=14, fontweight='bold', pad=20)
-        plt.tight_layout()
-        plt.savefig(output_dir / f"shap_importance_{model_name}.png", dpi=150, bbox_inches='tight')
-        plt.close()
+        plt.close('all')
         
         if verbose:
-            logger.info(f"    ✓ SHAP plots saved")
+            logger.info(f"    ✓ SHAP summary plot saved: shap_summary_{model_name}.png")
             
     except Exception as e:
         if verbose:
-            logger.warning(f"    ⚠️  SHAP analysis failed: {str(e)}")
-            logger.info(f"    → Using feature importance instead")
-        
-        # Fallback : utiliser feature importance
-        try:
-            importances = pd.Series(
-                model.feature_importances_, 
-                index=X_sample.columns
-            ).sort_values(ascending=False)
-            
-            plt.figure(figsize=(10, 8))
-            importances.head(20).plot(kind='barh')
-            plt.title(f'{model_name} - Feature Importance (Fallback)', fontsize=14, fontweight='bold')
-            plt.xlabel('Importance')
-            plt.tight_layout()
-            plt.savefig(output_dir / f"importance_{model_name.lower()}_fallback.png", dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            if verbose:
-                logger.info(f"    ✓ Fallback plot saved")
-        except:
-            pass
+            logger.error(f"    ❌ SHAP failed for {model_name}: {str(e)}")
+        _plot_importance_fallback(model, X_shap, model_name, output_dir, verbose)
 
 
-def shap_analysis_linear_model(
+def shap_summary_linear_model(
     model,
-    X_sample: pd.DataFrame,
+    X_shap: pd.DataFrame,
+    model_name: str,
+    output_dir: Path,
+    scaler=None,
+    verbose: bool = True
+):
+    """
+    SHAP Summary Plot pour Logistic Regression.
+    Applique le scaler si fourni (IMPORTANT: LogReg a été entraîné sur données scalées).
+    Génère UN SEUL plot (beeswarm summary).
+    """
+    if verbose:
+        logger.info(f"\n  → SHAP Summary: {model_name}")
+    
+    try:
+        # Limiter l'échantillon
+        n_sample = min(500, len(X_shap))
+        if len(X_shap) > n_sample:
+            X_sample = X_shap.sample(n=n_sample, random_state=42)
+        else:
+            X_sample = X_shap.copy()
+        
+        # Convertir en numpy array float64
+        X_array = X_sample.values.astype(np.float64)
+        feature_names = list(X_sample.columns)
+        
+        # Appliquer le scaler si fourni (IMPORTANT pour LogReg)
+        if scaler is not None:
+            X_scaled = scaler.transform(X_array)
+        else:
+            X_scaled = X_array
+        
+        # Background data pour LinearExplainer
+        n_background = min(100, len(X_scaled))
+        background = X_scaled[:n_background]
+        
+        # LinearExplainer
+        explainer = shap.LinearExplainer(model, background)
+        shap_values = explainer.shap_values(X_scaled)
+        
+        # Summary Plot - ONLY ONE PLOT
+        plt.figure(figsize=(12, 10))
+        shap.summary_plot(
+            shap_values, 
+            X_scaled,
+            feature_names=feature_names,
+            show=False, 
+            max_display=20
+        )
+        plt.title(f'{model_name} - SHAP Summary Plot', fontsize=14, fontweight='bold', pad=20)
+        plt.tight_layout()
+        plt.savefig(output_dir / f"shap_summary_{model_name}.png", dpi=150, bbox_inches='tight')
+        plt.close('all')
+        
+        if verbose:
+            logger.info(f"    ✓ SHAP summary plot saved: shap_summary_{model_name}.png")
+            
+    except Exception as e:
+        if verbose:
+            logger.error(f"    ❌ SHAP failed for {model_name}: {str(e)}")
+
+
+def _plot_importance_fallback(
+    model,
+    X_shap: pd.DataFrame,
     model_name: str,
     output_dir: Path,
     verbose: bool = True
 ):
     """
-    SHAP analysis for linear models (LogReg)
+    Fallback: feature importance quand SHAP échoue
+    """
+    try:
+        importances = pd.Series(
+            model.feature_importances_, 
+            index=X_shap.columns
+        ).sort_values(ascending=True)
+        
+        plt.figure(figsize=(12, 8))
+        importances.tail(20).plot(kind='barh', color='steelblue', alpha=0.8)
+        plt.xlabel('Importance', fontsize=12, fontweight='bold')
+        plt.title(f'{model_name} - Feature Importance (Fallback)', fontsize=14, fontweight='bold')
+        plt.grid(axis='x', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_dir / f"shap_summary_{model_name}_fallback.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        if verbose:
+            logger.info(f"    ✓ Fallback plot saved")
+    except Exception as e:
+        if verbose:
+            logger.error(f"    ❌ Fallback also failed: {str(e)}")
+
+
+# ============================================================================
+# FEATURE IMPORTANCE SUMMARY TABLE
+# ============================================================================
+
+def generate_feature_importance_summary(
+    models_base: dict,
+    models_tuned: dict,
+    feature_names: list,
+    output_dir: Path,
+    X_shap: pd.DataFrame = None,
+    scaler=None,
+    top_n: int = 5,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Generate a summary table of top features across all models.
+    
+    Uses BOTH Feature Importance AND SHAP values for robust ranking:
+    - Feature Importance: Gini importance (RF, XGBoost) + abs(coef) for LogReg
+    - SHAP: Mean absolute SHAP values (actual prediction impact)
+    
+    Args:
+        models_base: Dictionary of base models
+        models_tuned: Dictionary of tuned models
+        feature_names: List of feature names
+        output_dir: Directory to save outputs
+        X_shap: DataFrame for SHAP computation (optional but recommended)
+        scaler: Scaler for LogReg (optional)
+        top_n: Number of top features to include (default 5)
+        verbose: Print progress
+    
+    Returns:
+        DataFrame with top features summary
     """
     if verbose:
-        logger.info(f"\n  → SHAP analysis: {model_name}")
+        logger.info("\n--- Generating Feature Importance Summary Table ---")
+        logger.info("    Using BOTH Feature Importance AND SHAP values")
     
-    # Create explainer
-    explainer = shap.LinearExplainer(model, X_sample)
-    shap_values = explainer.shap_values(X_sample)
+    # Collect importances from all models
+    importance_data = {}
+    shap_data = {}
     
-    # Summary plot
-    plt.figure()
-    shap.summary_plot(shap_values, X_sample, show=False, max_display=20)
-    plt.title(f'{model_name} - SHAP Summary', fontsize=14, fontweight='bold', pad=20)
-    plt.tight_layout()
-    plt.savefig(output_dir / f"shap_summary_{model_name}.png", dpi=150, bbox_inches='tight')
-    plt.close()
+    # Helper to extract feature importance
+    def get_importance(model, model_name):
+        if 'LogisticRegression' in model_name:
+            return pd.Series(np.abs(model.coef_[0]), index=feature_names)
+        else:
+            return pd.Series(model.feature_importances_, index=feature_names)
     
-    # Bar plot
-    plt.figure()
-    shap.summary_plot(shap_values, X_sample, plot_type="bar", show=False, max_display=20)
-    plt.title(f'{model_name} - Feature Importance (SHAP)', fontsize=14, fontweight='bold', pad=20)
-    plt.tight_layout()
-    plt.savefig(output_dir / f"shap_importance_{model_name}.png", dpi=150, bbox_inches='tight')
-    plt.close()
+    # Helper to compute SHAP importance (mean |SHAP|)
+    def get_shap_importance(model, model_name, X_data):
+        try:
+            n_sample = min(200, len(X_data))
+            X_sample = X_data.sample(n=n_sample, random_state=42) if len(X_data) > n_sample else X_data
+            X_array = X_sample.values.astype(np.float64)
+            
+            if 'XGBoost' in model_name:
+                background = X_array[:min(50, len(X_array))]
+                explainer = shap.Explainer(model.predict_proba, background)
+                shap_vals = explainer(X_array).values[:, :, 1]
+            elif 'LogisticRegression' in model_name:
+                X_scaled = scaler.transform(X_array) if scaler is not None else X_array
+                background = X_scaled[:min(50, len(X_scaled))]
+                explainer = shap.LinearExplainer(model, background)
+                shap_vals = explainer.shap_values(X_scaled)
+            else:  # RandomForest
+                explainer = shap.TreeExplainer(model)
+                shap_vals = explainer.shap_values(X_array)
+                if isinstance(shap_vals, list):
+                    shap_vals = shap_vals[1]
+                elif len(shap_vals.shape) == 3:
+                    shap_vals = shap_vals[:, :, 1]
+            
+            mean_abs_shap = np.abs(shap_vals).mean(axis=0)
+            return pd.Series(mean_abs_shap, index=feature_names)
+        except Exception as e:
+            if verbose:
+                logger.warning(f"    SHAP failed for {model_name}: {str(e)[:50]}")
+            return None
     
+    # Helper to get direction (for LogReg only)
+    def get_direction(model, feature):
+        idx = feature_names.index(feature)
+        coef = model.coef_[0][idx]
+        if coef > 0:
+            return "↑ Risk"
+        else:
+            return "↓ Risk"
+    
+    # Extract Feature Importance from BASE models
+    for name, model in models_base.items():
+        importance_data[f"{name}_FI"] = get_importance(model, name)
+    
+    # Extract Feature Importance from TUNED models
+    if models_tuned:
+        for name, model in models_tuned.items():
+            importance_data[f"{name}_FI"] = get_importance(model, name)
+    
+    # Extract SHAP importance if X_shap provided
+    if X_shap is not None:
+        if verbose:
+            logger.info("    Computing SHAP importances...")
+        
+        for name, model in models_base.items():
+            shap_imp = get_shap_importance(model, name, X_shap)
+            if shap_imp is not None:
+                shap_data[f"{name}_SHAP"] = shap_imp
+        
+        if models_tuned:
+            for name, model in models_tuned.items():
+                shap_imp = get_shap_importance(model, name, X_shap)
+                if shap_imp is not None:
+                    shap_data[f"{name}_SHAP"] = shap_imp
+    
+    # Combine Feature Importance and SHAP data
+    all_data = {**importance_data, **shap_data}
+    df_importance = pd.DataFrame(all_data)
+    
+    # Normalize each column to [0, 1] for fair comparison
+    df_normalized = df_importance.apply(lambda x: x / x.max() if x.max() > 0 else x)
+    
+    # Compute average normalized importance across all models
+    df_normalized['Avg_Importance'] = df_normalized.mean(axis=1)
+    
+    # Rank features (1 = most important)
+    df_normalized['Rank'] = df_normalized['Avg_Importance'].rank(ascending=False).astype(int)
+    
+    # Sort by average importance
+    df_sorted = df_normalized.sort_values('Avg_Importance', ascending=False)
+    
+    # Select top N features
+    top_features = df_sorted.head(top_n).copy()
+    
+    # Get direction from LogReg (base model)
+    if 'LogisticRegression_base' in models_base:
+        logreg = models_base['LogisticRegression_base']
+        top_features['Effect'] = [get_direction(logreg, f) for f in top_features.index]
+    else:
+        top_features['Effect'] = "N/A"
+    
+    # Log how many sources used
+    n_fi = len(importance_data)
+    n_shap = len(shap_data)
     if verbose:
-        logger.info(f"    ✓ SHAP plots saved")
+        logger.info(f"    Sources: {n_fi} Feature Importance + {n_shap} SHAP = {n_fi + n_shap} total")
+    
+    # Create clean summary table for Word documentation
+    # Compute average FI and average SHAP separately for clarity
+    fi_cols = [c for c in top_features.columns if '_FI' in c]
+    shap_cols = [c for c in top_features.columns if '_SHAP' in c]
+    
+    avg_fi = top_features[fi_cols].mean(axis=1).values if fi_cols else [0] * top_n
+    avg_shap = top_features[shap_cols].mean(axis=1).values if shap_cols else [0] * top_n
+    
+    summary_table = pd.DataFrame({
+        'Rank': range(1, top_n + 1),
+        'Feature': top_features.index,
+        'Avg_FI': avg_fi,
+        'Avg_SHAP': avg_shap,
+        'Combined': top_features['Avg_Importance'].values,
+        'Effect': top_features['Effect'].values
+    })
+    
+    # Round numeric columns
+    numeric_cols = ['Avg_FI', 'Avg_SHAP', 'Combined']
+    for col in numeric_cols:
+        if col in summary_table.columns:
+            summary_table[col] = summary_table[col].round(3)
+    
+    # Save to CSV in data folder
+    data_dir = output_dir.parents[1] / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = data_dir / "top_features_summary.csv"
+    summary_table.to_csv(csv_path, index=False)
+    if verbose:
+        logger.info(f"✓ Summary table saved: {csv_path}")
+    
+    # Create visual table (PNG)
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.axis('off')
+    
+    # Table data
+    cell_text = summary_table.values.tolist()
+    col_labels = summary_table.columns.tolist()
+    
+    # Create table
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        cellLoc='center',
+        loc='center',
+        colColours=['#4472C4'] * len(col_labels)
+    )
+    
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.8)
+    
+    # Style header
+    for j, label in enumerate(col_labels):
+        cell = table[(0, j)]
+        cell.set_text_props(weight='bold', color='white')
+        cell.set_facecolor('#4472C4')
+    
+    # Alternate row colors
+    for i in range(1, len(cell_text) + 1):
+        for j in range(len(col_labels)):
+            cell = table[(i, j)]
+            if i % 2 == 0:
+                cell.set_facecolor('#D6DCE5')
+            else:
+                cell.set_facecolor('#FFFFFF')
+            # Highlight Effect column
+            if j == len(col_labels) - 1:  # Effect column
+                if '↑' in str(cell_text[i-1][j]):
+                    cell.set_text_props(color='red', weight='bold')
+                elif '↓' in str(cell_text[i-1][j]):
+                    cell.set_text_props(color='green', weight='bold')
+    
+    plt.title('Top Features Affecting Bankruptcy Risk\n(Normalized Importance Scores)', 
+              fontsize=14, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    png_path = output_dir / "top_features_table.png"
+    plt.savefig(png_path, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.close()
+    if verbose:
+        logger.info(f"✓ Visual table saved: {png_path}")
+    
+    # Print to console
+    if verbose:
+        logger.info("\n" + "="*80)
+        logger.info("TOP FEATURES AFFECTING BANKRUPTCY RISK")
+        logger.info("="*80)
+        logger.info(f"\n{summary_table.to_string(index=False)}")
+        logger.info("\n" + "-"*80)
+        logger.info("Effect: ↑ Risk = increases bankruptcy probability")
+        logger.info("        ↓ Risk = decreases bankruptcy probability")
+        logger.info("="*80)
+    
+    return summary_table
 
 
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
-def run_eda_pipeline(df: pd.DataFrame, plots_dir: Path, verbose: bool = True):
+def run_eda_pipeline(df: pd.DataFrame, plots_dir: Path, verbose: bool = True, selected_features: list = None):
     """
-    Complete EDA pipeline
+    Complete EDA pipeline - saves to eda/ subfolder
     """
     if verbose:
         logger.info("\n--- Exploratory Data Analysis ---")
     
-    plot_target_distribution(df, plots_dir / "eda_target_distribution.png")
-    plot_temporal_distribution(df, plots_dir / "eda_temporal_distribution.png")
-    plot_correlation_heatmap(df, plots_dir / "eda_correlation_heatmap.png")
-    # plot_feature_distributions_by_target(df, plots_dir / "eda_feature_distributions.png")
+    # Create EDA subfolder
+    eda_dir = plots_dir / "eda"
+    eda_dir.mkdir(parents=True, exist_ok=True)
+    
+    plot_target_distribution(df, eda_dir / "target_distribution.png")
+    plot_temporal_distribution(df, eda_dir / "temporal_distribution.png")
+    plot_correlation_heatmap(df, eda_dir / "correlation_heatmap.png", selected_features)
     
     if verbose:
-        logger.info("✓ EDA plots complete")
+        logger.info(f"✓ EDA plots saved to {eda_dir}")
 
 
 def run_interpretation_pipeline(
-    models_tuned: dict,
-    X_sample: pd.DataFrame,
+    models_base: dict,
+    X_shap: pd.DataFrame,
     plots_dir: Path,
-    verbose: bool = True
+    verbose: bool = True,
+    scaler=None,
+    models_tuned: dict = None
 ):
     """
-    Complete model interpretation pipeline
+    Complete model interpretation pipeline - BASE and TUNED models
+    Saves to models/ subfolder
+    Generates 6 SHAP summary plots (1 per model × 2 versions)
     """
     if verbose:
-        logger.info("\n--- Model Interpretation ---")
+        logger.info("\n--- Model Interpretation (BASE models) ---")
     
-    feature_names = list(X_sample.columns)
+    # Create model_interpretation subfolder
+    models_dir = plots_dir / "model_interpretation"
+    models_dir.mkdir(parents=True, exist_ok=True)
     
-    # Feature importance
-    if 'RandomForest_tuned' in models_tuned:
+    feature_names = list(X_shap.columns)
+    
+    # ========== BASE MODELS ==========
+    # Feature importance (BASE models)
+    if 'RandomForest_base' in models_base:
         plot_feature_importance_rf(
-            models_tuned['RandomForest_tuned'],
+            models_base['RandomForest_base'],
             feature_names,
-            plots_dir / "importance_rf.png"
+            models_dir / "importance_rf_base.png"
         )
     
-    if 'XGBoost_tuned' in models_tuned:
+    if 'XGBoost_base' in models_base:
         plot_feature_importance_xgb(
-            models_tuned['XGBoost_tuned'],
+            models_base['XGBoost_base'],
             feature_names,
-            plots_dir / "importance_xgb.png"
+            models_dir / "importance_xgb_base.png"
         )
     
-    if 'LogisticRegression_tuned' in models_tuned:
+    if 'LogisticRegression_base' in models_base:
         plot_logistic_regression_coef(
-            models_tuned['LogisticRegression_tuned'],
+            models_base['LogisticRegression_base'],
             feature_names,
-            plots_dir / "importance_logreg.png"
+            models_dir / "importance_logreg_base.png"
         )
     
-    # SHAP analysis
-    if config.evaluation.enable_shap and verbose:
-        logger.info("\n--- SHAP Analysis ---")
+    # SHAP Summary Plots (BASE models)
+    if config.evaluation.enable_shap:
+        if verbose:
+            logger.info("\n--- SHAP Summary Plots (BASE models) ---")
         
-        if 'RandomForest_tuned' in models_tuned:
-            shap_analysis_tree_model(
-                models_tuned['RandomForest_tuned'],
-                X_sample,
-                'RandomForest',
-                plots_dir,
+        if 'RandomForest_base' in models_base:
+            shap_summary_tree_model(
+                models_base['RandomForest_base'],
+                X_shap,
+                'RandomForest_base',
+                models_dir,
                 verbose
+            )
+        
+        if 'XGBoost_base' in models_base:
+            shap_summary_tree_model(
+                models_base['XGBoost_base'],
+                X_shap,
+                'XGBoost_base',
+                models_dir,
+                verbose
+            )
+        
+        if 'LogisticRegression_base' in models_base:
+            shap_summary_linear_model(
+                models_base['LogisticRegression_base'],
+                X_shap,
+                'LogisticRegression_base',
+                models_dir,
+                scaler=scaler,
+                verbose=verbose
+            )
+    
+    if verbose:
+        logger.info(f"\n✓ BASE model interpretation plots saved to {models_dir}")
+    
+    # ========== TUNED MODELS ==========
+    if models_tuned is not None:
+        if verbose:
+            logger.info("\n--- Model Interpretation (TUNED models) ---")
+        
+        # Feature importance (TUNED models)
+        if 'RandomForest_tuned' in models_tuned:
+            plot_feature_importance_rf(
+                models_tuned['RandomForest_tuned'],
+                feature_names,
+                models_dir / "importance_rf_tuned.png"
             )
         
         if 'XGBoost_tuned' in models_tuned:
-            shap_analysis_tree_model(
+            plot_feature_importance_xgb(
                 models_tuned['XGBoost_tuned'],
-                X_sample,
-                'XGBoost',
-                plots_dir,
-                verbose
+                feature_names,
+                models_dir / "importance_xgb_tuned.png"
             )
+        
+        if 'LogisticRegression_tuned' in models_tuned:
+            plot_logistic_regression_coef(
+                models_tuned['LogisticRegression_tuned'],
+                feature_names,
+                models_dir / "importance_logreg_tuned.png"
+            )
+        
+        # SHAP Summary Plots (TUNED models)
+        if config.evaluation.enable_shap:
+            if verbose:
+                logger.info("\n--- SHAP Summary Plots (TUNED models) ---")
+            
+            if 'RandomForest_tuned' in models_tuned:
+                shap_summary_tree_model(
+                    models_tuned['RandomForest_tuned'],
+                    X_shap,
+                    'RandomForest_tuned',
+                    models_dir,
+                    verbose
+                )
+            
+            if 'XGBoost_tuned' in models_tuned:
+                shap_summary_tree_model(
+                    models_tuned['XGBoost_tuned'],
+                    X_shap,
+                    'XGBoost_tuned',
+                    models_dir,
+                    verbose
+                )
+            
+            if 'LogisticRegression_tuned' in models_tuned:
+                shap_summary_linear_model(
+                    models_tuned['LogisticRegression_tuned'],
+                    X_shap,
+                    'LogisticRegression_tuned',
+                    models_dir,
+                    scaler=scaler,
+                    verbose=verbose
+                )
+        
+        if verbose:
+            logger.info(f"\n✓ TUNED model interpretation plots saved to {models_dir}")
     
-    if verbose:
-        logger.info("\n✓ Model interpretation complete")
+    # ========== FEATURE IMPORTANCE SUMMARY TABLE ==========
+    generate_feature_importance_summary(
+        models_base=models_base,
+        models_tuned=models_tuned,
+        feature_names=feature_names,
+        output_dir=models_dir,
+        X_shap=X_shap,
+        scaler=scaler,
+        top_n=10,
+        verbose=verbose
+    )
 
 
 def run_eda_interpretation_pipeline(
     df: pd.DataFrame,
-    models_tuned: dict,
-    verbose: bool = True
+    models_base: dict,
+    verbose: bool = True,
+    selected_features: list = None,
+    scaler=None,
+    models_tuned: dict = None
 ):
     """
-    Complete EDA + Interpretation pipeline
+    Complete EDA + Interpretation pipeline (BASE and TUNED models)
     
     Args:
         df: Full dataset
-        models_tuned: Trained tuned models
+        models_base: Trained BASE models
         verbose: Print progress
+        selected_features: List of RFE selected features (required for correct SHAP)
+        scaler: StandardScaler used for LogisticRegression (optional but recommended)
+        models_tuned: Trained TUNED models (optional, if provided will generate plots for them too)
     """
-    logger.info("\n" + "="*70)
-    logger.info("MODULE 05: EDA & INTERPRETATION")
-    logger.info("="*70)
+    print("\n" + "="*70)
+    print("MODULE 05: EDA & INTERPRETATION (BASE + TUNED MODELS)")
+    print("="*70)
     
-    # 1. EDA
-    run_eda_pipeline(df, config.plots_dir, verbose)
+    # 1. EDA (with RFE features for correlation heatmap)
+    run_eda_pipeline(df, config.plots_dir, verbose, selected_features)
     
-    # 2. Sample for SHAP
-    feature_cols = [f for f in config.data.feature_cols if f in df.columns]
+    # 2. Prepare SHAP data with RFE features
+    if selected_features is not None:
+        feature_cols = selected_features
+    else:
+        feature_cols = [f for f in config.data.feature_cols if f in df.columns]
+    
+    if verbose:
+        logger.info(f"\n→ Using {len(feature_cols)} features for SHAP analysis")
+    
+    # Échantillonner le dataset
     n_sample = min(config.evaluation.shap_sample_size, len(df))
     df_sample = df.sample(n=n_sample, random_state=config.models.random_state)
-    X_sample = df_sample[feature_cols]
     
-    # 3. Interpretation
-    run_interpretation_pipeline(models_tuned, X_sample, config.plots_dir, verbose)
+    # Préparer les données SHAP (conversion numérique avec prepare_shap_data)
+    X_shap = prepare_shap_data(df_sample, feature_cols)
     
-    logger.info("\n" + "="*70)
-    logger.info("✅ MODULE 05 COMPLETED")
-    logger.info("="*70)
+    if verbose:
+        logger.info(f"→ SHAP sample: {X_shap.shape[0]} rows × {X_shap.shape[1]} features")
+        logger.info(f"→ Features: {list(X_shap.columns)[:5]}...\n showing first 5")
+    
+    # 3. Interpretation (BASE + TUNED models) avec scaler pour LogReg
+    run_interpretation_pipeline(models_base, X_shap, config.plots_dir, verbose, scaler, models_tuned)
+    
+    print("")
+    print("\n" + "="*70)
+    print("MODULE 05 COMPLETED")
+    print("="*70)
 
 
 if __name__ == "__main__":
+    # Configure logging for standalone execution
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
     import pickle
+    import joblib
     
     # Load data
     df_path = config.data_dir / "dataset_clean.csv"
     df = pd.read_csv(df_path)
     
-    # Load tuned models
-    with open(config.models_dir / "models_tuned.pkl", 'rb') as f:
-        models_tuned = pickle.load(f)
+    # Load BASE models
+    with open(config.models_dir / "models_base.pkl", 'rb') as f:
+        models_base = pickle.load(f)
     
-    # Run pipeline
-    run_eda_interpretation_pipeline(df, models_tuned, verbose=True)
+    # Load TUNED models
+    models_tuned = None
+    tuned_path = config.models_dir / "models_tuned.pkl"
+    if tuned_path.exists():
+        with open(tuned_path, 'rb') as f:
+            models_tuned = pickle.load(f)
+        logger.info("Loaded TUNED models for interpretation")
     
-    print("\n🎯 EDA & Interpretation complete!")
+    # Load metadata to get selected_features
+    metadata_path = config.models_dir / "metadata.pkl"
+    selected_features = None
+    if metadata_path.exists():
+        with open(metadata_path, 'rb') as f:
+            metadata = pickle.load(f)
+        selected_features = metadata.get('selected_features')
+        if selected_features:
+            logger.info(f"Loaded {len(selected_features)} RFE features from metadata")
+    
+    # Load scaler for LogisticRegression
+    scaler_path = config.models_dir / "scaler.pkl"
+    scaler = None
+    if scaler_path.exists():
+        scaler = joblib.load(scaler_path)
+        logger.info("Loaded scaler for LogisticRegression SHAP")
+    
+    # Run pipeline with selected_features, scaler, and tuned models
+    run_eda_interpretation_pipeline(
+        df, 
+        models_base, 
+        verbose=True,
+        selected_features=selected_features,
+        scaler=scaler,
+        models_tuned=models_tuned
+    )
+    
+    print("\nEDA & Interpretation complete!")

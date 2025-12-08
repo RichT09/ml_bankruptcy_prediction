@@ -1,627 +1,336 @@
-# 04_evaluation.py
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Module 04: Model Evaluation & Comparison
-Comprehensive metrics, visualizations, base vs tuned comparison
+Module 04: Model Evaluation
+Business-constrained threshold optimization + calibrated probabilities
+
+Author: Master Finance Student
+HEC Lausanne - Fall 2025
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import (
-    roc_auc_score, roc_curve, auc,
-    precision_recall_curve, average_precision_score,
-    confusion_matrix, classification_report,
-    accuracy_score, precision_score, recall_score, f1_score
-)
+from typing import Dict
 import pickle
-import logging
 from pathlib import Path
-import sys
-from typing import Dict, Tuple
-import warnings
-warnings.filterwarnings('ignore')
+import logging
 
-# Setup
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    classification_report,
+    confusion_matrix,
+    RocCurveDisplay,
+    PrecisionRecallDisplay,
+    precision_recall_curve,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.calibration import CalibratedClassifierCV, IsotonicRegression
+
+# Import config and paths
+from .config import config, PLOTS_DIR, DATA_DIR, YEAR_COL, TARGET_COL, FEATURE_COLS, SPLIT_YEAR
+
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from src.config import config
-except ImportError:
-    import config
+# -------------------------------------------------------------------
+#  Probability Calibration
+# -------------------------------------------------------------------
 
-# Set plot style
-sns.set_style("whitegrid")
-plt.rcParams['figure.dpi'] = config.evaluation.figure_dpi
-plt.rcParams['font.size'] = 10
-
-
-# ============================================================================
-# PREDICTIONS
-# ============================================================================
-
-def predict_all_models(
-    models: Dict, 
-    X_test, 
-    X_test_scaled,
-    verbose: bool = True
-) -> Tuple[Dict, Dict]:
+def calibrate_probabilities(y_true, y_proba, method='isotonic'):
     """
-    Generate predictions for all models
+    Calibrate predicted probabilities using Isotonic Regression or Platt Scaling
     
-    Args:
-        models: Dictionary of trained models
-        X_test: Raw test features
-        X_test_scaled: Scaled test features
-        verbose: Print progress
+    WHY CALIBRATION?
+    - Raw model probabilities may not reflect true probability of default
+    - Calibration ensures predicted prob ≈ actual prob (e.g., 0.7 pred → 70% actual default)
+    - Better for business decisions
     
-    Returns:
-        predictions dict, probabilities dict
-    """
-    y_pred = {}
-    y_proba = {}
+    ISOTONIC vs PLATT:
+    - Isotonic: More flexible, handles any monotonic relationship (recommended)
+    - Platt: Simple sigmoid, assumes logistic-like relationship
     
-    if verbose:
-        logger.info("\n--- Generating Predictions ---")
-    
-    for name, model in models.items():
-        # Use scaled data for linear models
-        if 'LogisticRegression' in name or 'SVM' in name:
-            X = X_test_scaled
-        else:
-            X = X_test
-        
-        proba = model.predict_proba(X)[:, 1]
-        pred = model.predict(X)
-        
-        y_pred[name] = pred
-        y_proba[name] = proba
-        
-        if verbose:
-            logger.info(f"  ✓ {name}")
-    
-    return y_pred, y_proba
-
-
-# ============================================================================
-# METRICS COMPUTATION
-# ============================================================================
-
-def compute_metrics(y_true, y_pred, y_proba, model_name: str) -> Dict:
-    """
-    Compute comprehensive metrics for a single model
+    For bankruptcy prediction: ISOTONIC is better (handles non-linear calibration)
     
     Args:
         y_true: True labels
-        y_pred: Predicted labels
-        y_proba: Predicted probabilities
-        model_name: Name of the model
+        y_proba: Predicted probabilities (0-1)
+        method: 'isotonic' or 'platt'
     
     Returns:
-        Dictionary of metrics
+        calibrator: Fitted calibration model
+        y_proba_calibrated: Calibrated probabilities
     """
+    if method == 'isotonic':
+        calibrator = IsotonicRegression(out_of_bounds='clip', y_min=0, y_max=1)
+    elif method == 'platt':
+        from sklearn.linear_model import LogisticRegression
+        # Platt scaling: fit logistic regression
+        calibrator = LogisticRegression(max_iter=1000)
+        y_proba_2d = np.column_stack([1 - y_proba, y_proba])
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    if method == 'isotonic':
+        y_proba_calibrated = calibrator.fit_transform(y_proba, y_true)
+    else:  # platt
+        calibrator.fit(y_proba_2d, y_true)
+        y_proba_calibrated = calibrator.predict_proba(y_proba_2d)[:, 1]
+    
+    return calibrator, y_proba_calibrated
+
+
+def apply_calibration(y_proba, calibrator):
+    """Apply fitted calibrator to new probabilities"""
+    if isinstance(calibrator, IsotonicRegression):
+        return calibrator.transform(y_proba)
+    else:  # Platt
+        y_proba_2d = np.column_stack([1 - y_proba, y_proba])
+        return calibrator.predict_proba(y_proba_2d)[:, 1]
+
+
+# -------------------------------------------------------------------
+#  Business-Constrained Threshold Selection
+# -------------------------------------------------------------------
+
+def find_optimal_threshold_f1(y_true, y_proba, verbose=False):
+    """
+    SELECT THRESHOLD THAT MAXIMIZES F1-SCORE
+    
+    Simple and effective: Find the threshold that gives best F1 balance.
+    
+    Args:
+        y_true: True labels
+        y_proba: Predicted probabilities (0-1)
+        verbose: Print details (default False - only show once in pipeline)
+    
+    Returns:
+        optimal_threshold: Best threshold value
+        metrics: Dict with metrics at optimal threshold
+        calibrated_proba: Calibrated probabilities
+        calibrator: Fitted calibrator
+    """
+    # Step 1: Calibrate probabilities
+    calibrator, y_proba_calibrated = calibrate_probabilities(y_true, y_proba, method='isotonic')
+    
+    # Step 2: Compute Precision-Recall curve
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba_calibrated)
+    
+    # Step 3: Compute F1 for each threshold and find max
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_idx = np.argmax(f1_scores)
+    
+    optimal_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+    
+    # Step 4: Compute metrics at optimal threshold
     metrics = {
-        'model': model_name,
-        'accuracy': accuracy_score(y_true, y_pred),
-        'precision': precision_score(y_true, y_pred, zero_division=0),
-        'recall': recall_score(y_true, y_pred, zero_division=0),
-        'f1': f1_score(y_true, y_pred, zero_division=0),
-        'auc': roc_auc_score(y_true, y_proba),
-        'avg_precision': average_precision_score(y_true, y_proba),
+        'threshold': float(optimal_threshold),
+        'precision': float(precisions[best_idx]),
+        'recall': float(recalls[best_idx]),
+        'f1': float(f1_scores[best_idx]),
+        'method': 'F1-maximizing',
+        'calibrated': True
     }
     
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    if cm.shape == (2, 2):
-        tn, fp, fn, tp = cm.ravel()
-        metrics['tn'] = int(tn)
-        metrics['fp'] = int(fp)
-        metrics['fn'] = int(fn)
-        metrics['tp'] = int(tp)
-        metrics['specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    if verbose:
+        logger.info(f"Optimal Threshold (F1-max): {metrics['threshold']:.4f}")
+        logger.info(f"  Precision: {metrics['precision']:.4f} | Recall: {metrics['recall']:.4f} | F1: {metrics['f1']:.4f}")
     
-    return metrics
+    return optimal_threshold, metrics, y_proba_calibrated, calibrator
 
 
-def evaluate_all_models(
-    y_test,
-    predictions_base: Dict,
-    probabilities_base: Dict,
-    predictions_tuned: Dict,
-    probabilities_tuned: Dict,
-    verbose: bool = True
-) -> pd.DataFrame:
+# -------------------------------------------------------------------
+#  Threshold Visualization
+# -------------------------------------------------------------------
+
+def plot_threshold_analysis(y_true, y_proba, model_name, save_dir):
     """
-    Evaluate all models and create comparison DataFrame
+    Plot Precision, Recall, F1 vs threshold
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(thresholds, precisions[:-1], label='Precision', linewidth=2, color='blue')
+    plt.plot(thresholds, recalls[:-1], label='Recall', linewidth=2, color='green')
+    plt.plot(thresholds, f1_scores[:-1], label='F1-score', linewidth=2.5, linestyle='--', color='red')
+    
+    plt.axvline(best_threshold, color='darkred', linestyle=':', linewidth=2, 
+                label=f'Optimal threshold = {best_threshold:.4f}')
+    
+    plt.xlabel('Threshold', fontsize=12, fontweight='bold')
+    plt.ylabel('Score', fontsize=12, fontweight='bold')
+    plt.title(f'{model_name} - Metrics vs Decision Threshold', fontsize=14, fontweight='bold')
+    plt.legend(loc='best', fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.tight_layout()
+    
+    save_path = save_dir / f"threshold_analysis_{model_name}.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  Saved: {save_path.name}")
+
+
+# -------------------------------------------------------------------
+#  Overfitting Analysis
+# -------------------------------------------------------------------
+
+def compute_overfitting_table(all_models, data, selected_features=None, verbose=True):
+    """
+    Compare Train vs Test metrics to detect overfitting
+    
+    Overfitting indicators:
+    - Large gap between train and test accuracy/AUC
+    - Train accuracy near 100% with lower test accuracy
     
     Args:
-        y_test: True test labels
-        predictions_base: Base model predictions
-        probabilities_base: Base model probabilities
-        predictions_tuned: Tuned model predictions
-        probabilities_tuned: Tuned model probabilities
-        verbose: Print results
+        all_models: Dictionary of trained models
+        data: Dictionary from preprocessing pipeline
+        selected_features: List of RFE-selected features
+        verbose: Print table
     
     Returns:
-        DataFrame with all metrics
+        DataFrame with train/test comparison
     """
-    if verbose:
-        logger.info("\n--- Computing Metrics ---")
+    from sklearn.metrics import accuracy_score
+    
+    X_train = data['X_train']
+    X_test = data['X_test']
+    X_train_scaled = data['X_train_scaled']
+    X_test_scaled = data['X_test_scaled']
+    y_train = data['y_train']
+    y_test = data['y_test']
+    
+    # Apply feature selection if provided
+    if selected_features is not None:
+        feature_mask = [col in selected_features for col in X_train.columns]
+        X_train = X_train.loc[:, feature_mask]
+        X_test = X_test.loc[:, feature_mask]
+        X_train_scaled = X_train_scaled[:, feature_mask]
+        X_test_scaled = X_test_scaled[:, feature_mask]
     
     results = []
     
-    # Evaluate base models
-    for name, pred in predictions_base.items():
-        proba = probabilities_base[name]
-        metrics = compute_metrics(y_test, pred, proba, name)
-        results.append(metrics)
+    for name, model in all_models.items():
+        # Determine which data to use
+        if 'LogisticRegression' in name:
+            X_tr, X_te = X_train_scaled, X_test_scaled
+        else:
+            X_tr, X_te = X_train, X_test
+        
+        # Train predictions
+        y_pred_train = model.predict(X_tr)
+        y_proba_train = model.predict_proba(X_tr)[:, 1]
+        
+        # Test predictions
+        y_pred_test = model.predict(X_te)
+        y_proba_test = model.predict_proba(X_te)[:, 1]
+        
+        # Compute metrics
+        acc_train = accuracy_score(y_train, y_pred_train)
+        acc_test = accuracy_score(y_test, y_pred_test)
+        auc_train = roc_auc_score(y_train, y_proba_train)
+        auc_test = roc_auc_score(y_test, y_proba_test)
+        
+        # Gaps (positive = overfitting)
+        acc_gap = acc_train - acc_test
+        auc_gap = auc_train - auc_test
+        
+        results.append({
+            'Model': name,
+            'Acc_Train': acc_train,
+            'Acc_Test': acc_test,
+            'Acc_Gap': acc_gap,
+            'AUC_Train': auc_train,
+            'AUC_Test': auc_test,
+            'AUC_Gap': auc_gap,
+            'Overfit': 'YES' if auc_gap > 0.05 else 'NO'
+        })
     
-    # Evaluate tuned models
-    for name, pred in predictions_tuned.items():
-        proba = probabilities_tuned[name]
-        metrics = compute_metrics(y_test, pred, proba, name)
-        results.append(metrics)
+    df_overfit = pd.DataFrame(results)
+    df_overfit = df_overfit.set_index('Model')
     
-    df_results = pd.DataFrame(results)
+    # Save to CSV
+    out_path = DATA_DIR / "overfitting_analysis.csv"
+    df_overfit.to_csv(out_path)
     
     if verbose:
-        logger.info("\n✓ Metrics computed for all models")
-        logger.info(f"\n{df_results[['model', 'accuracy', 'precision', 'recall', 'f1', 'auc']].to_string()}")
+        logger.info("")
+        logger.info("-" * 100)
+        logger.info(f"{'Model':<35} {'Acc_Train':>10} {'Acc_Test':>10} {'Gap':>8} {'AUC_Train':>10} {'AUC_Test':>10} {'Gap':>8} {'Overfit':>8}")
+        logger.info("-" * 100)
+        for _, row in df_overfit.iterrows():
+            logger.info(f"{row.name:<35} {row['Acc_Train']:>10.4f} {row['Acc_Test']:>10.4f} {row['Acc_Gap']:>+8.4f} {row['AUC_Train']:>10.4f} {row['AUC_Test']:>10.4f} {row['AUC_Gap']:>+8.4f} {row['Overfit']:>8}")
+        logger.info("-" * 100)
+        logger.info(f"Overfit threshold: AUC gap > 5%")
+        logger.info(f"Saved: {out_path}")
     
-    return df_results
+    return df_overfit
 
 
-# ============================================================================
-# VISUALIZATIONS - COMPARISON PLOTS
-# ============================================================================
+# -------------------------------------------------------------------
+#  Pipeline
+# -------------------------------------------------------------------
 
-def plot_metric_comparison(
-    df_results: pd.DataFrame,
-    metric: str,
-    title: str,
-    output_path: Path,
-    figsize=(12, 6)
-):
+def run_evaluation_pipeline(models_base, models_tuned, data, verbose=True, selected_features=None):
     """
-    Create bar plot comparing metric across all models
+    Complete evaluation pipeline - Compatible with main.py
+    
+    - Calibrates probabilities (isotonic)
+    - Evaluates all models at threshold 0.5
+    - Generates ROC/PR curves, confusion matrices, annual backtest
+    
+    Note: The utility function `find_optimal_threshold_f1` is available
+    for manual threshold analysis if needed.
     
     Args:
-        df_results: DataFrame with metrics
-        metric: Metric column name
-        title: Plot title
-        output_path: Save path
-        figsize: Figure size
-    """
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Separate base and tuned
-    df_base = df_results[df_results['model'].str.contains('_base')]
-    df_tuned = df_results[df_results['model'].str.contains('_tuned')]
-    
-    # Extract model family
-    df_base['family'] = df_base['model'].str.replace('_base', '')
-    df_tuned['family'] = df_tuned['model'].str.replace('_tuned', '')
-    
-    x = np.arange(len(df_base))
-    width = 0.35
-    
-    bars1 = ax.bar(x - width/2, df_base[metric], width, label='Base', alpha=0.8, color='skyblue')
-    bars2 = ax.bar(x + width/2, df_tuned[metric], width, label='Tuned', alpha=0.8, color='coral')
-    
-    ax.set_xlabel('Model', fontsize=12, fontweight='bold')
-    ax.set_ylabel(metric.upper(), fontsize=12, fontweight='bold')
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
-    ax.set_xticks(x)
-    ax.set_xticklabels(df_base['family'], rotation=15, ha='right')
-    ax.legend(fontsize=11)
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.3f}',
-                   ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  ✓ {output_path.name}")
-
-
-def create_all_comparison_plots(df_results: pd.DataFrame, plots_dir: Path):
-    """
-    Create all metric comparison plots
-    
-    Args:
-        df_results: DataFrame with all metrics
-        plots_dir: Directory to save plots
-    """
-    logger.info("\n--- Creating Comparison Plots ---")
-    
-    comparisons = [
-        ('precision', 'Precision Comparison: Base vs Tuned'),
-        ('recall', 'Recall Comparison: Base vs Tuned'),
-        ('f1', 'F1-Score Comparison: Base vs Tuned'),
-        ('auc', 'AUC Comparison: Base vs Tuned'),
-        ('accuracy', 'Accuracy Comparison: Base vs Tuned'),
-    ]
-    
-    for metric, title in comparisons:
-        output_path = plots_dir / f"{metric}_comparison.png"
-        plot_metric_comparison(df_results, metric, title, output_path)
-
-
-# ============================================================================
-# ROC CURVES
-# ============================================================================
-
-def plot_roc_curves_comparison(
-    y_test,
-    probabilities_base: Dict,
-    probabilities_tuned: Dict,
-    output_path: Path
-):
-    """
-    Plot ROC curves with base vs tuned comparison
-    
-    Args:
-        y_test: True labels
-        probabilities_base: Base model probabilities
-        probabilities_tuned: Tuned model probabilities
-        output_path: Save path
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Base models
-    ax = axes[0]
-    for name, proba in probabilities_base.items():
-        fpr, tpr, _ = roc_curve(y_test, proba)
-        roc_auc = auc(fpr, tpr)
-        model_family = name.replace('_base', '')
-        ax.plot(fpr, tpr, lw=2, label=f'{model_family} (AUC={roc_auc:.3f})')
-    
-    ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Random')
-    ax.set_xlabel('False Positive Rate', fontsize=12, fontweight='bold')
-    ax.set_ylabel('True Positive Rate', fontsize=12, fontweight='bold')
-    ax.set_title('ROC Curves - BASE Models', fontsize=14, fontweight='bold')
-    ax.legend(loc='lower right', fontsize=10)
-    ax.grid(alpha=0.3)
-    
-    # Tuned models
-    ax = axes[1]
-    for name, proba in probabilities_tuned.items():
-        fpr, tpr, _ = roc_curve(y_test, proba)
-        roc_auc = auc(fpr, tpr)
-        model_family = name.replace('_tuned', '')
-        ax.plot(fpr, tpr, lw=2, label=f'{model_family} (AUC={roc_auc:.3f})')
-    
-    ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Random')
-    ax.set_xlabel('False Positive Rate', fontsize=12, fontweight='bold')
-    ax.set_ylabel('True Positive Rate', fontsize=12, fontweight='bold')
-    ax.set_title('ROC Curves - TUNED Models', fontsize=14, fontweight='bold')
-    ax.legend(loc='lower right', fontsize=10)
-    ax.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  ✓ {output_path.name}")
-
-
-# ============================================================================
-# PRECISION-RECALL CURVES
-# ============================================================================
-
-def plot_pr_curves_comparison(
-    y_test,
-    probabilities_base: Dict,
-    probabilities_tuned: Dict,
-    output_path: Path
-):
-    """
-    Plot Precision-Recall curves with base vs tuned comparison
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Base models
-    ax = axes[0]
-    for name, proba in probabilities_base.items():
-        precision, recall, _ = precision_recall_curve(y_test, proba)
-        avg_prec = average_precision_score(y_test, proba)
-        model_family = name.replace('_base', '')
-        ax.plot(recall, precision, lw=2, label=f'{model_family} (AP={avg_prec:.3f})')
-    
-    ax.set_xlabel('Recall', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax.set_title('Precision-Recall Curves - BASE Models', fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(alpha=0.3)
-    
-    # Tuned models
-    ax = axes[1]
-    for name, proba in probabilities_tuned.items():
-        precision, recall, _ = precision_recall_curve(y_test, proba)
-        avg_prec = average_precision_score(y_test, proba)
-        model_family = name.replace('_tuned', '')
-        ax.plot(recall, precision, lw=2, label=f'{model_family} (AP={avg_prec:.3f})')
-    
-    ax.set_xlabel('Recall', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax.set_title('Precision-Recall Curves - TUNED Models', fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  ✓ {output_path.name}")
-
-
-# ============================================================================
-# CONFUSION MATRICES
-# ============================================================================
-
-def plot_confusion_matrices(
-    y_test,
-    predictions_base: Dict,
-    predictions_tuned: Dict,
-    output_path: Path
-):
-    """
-    Plot confusion matrices grid (2 rows: base, tuned)
-    """
-    n_models = len(predictions_base)
-    fig, axes = plt.subplots(2, n_models, figsize=(4*n_models, 8))
-    
-    # Base models
-    for idx, (name, pred) in enumerate(predictions_base.items()):
-        ax = axes[0, idx] if n_models > 1 else axes[0]
-        cm = confusion_matrix(y_test, pred)
-        
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=False)
-        model_family = name.replace('_base', '')
-        ax.set_title(f'{model_family}\n(BASE)', fontsize=11, fontweight='bold')
-        ax.set_ylabel('True Label', fontsize=10)
-        ax.set_xlabel('Predicted Label', fontsize=10)
-    
-    # Tuned models
-    for idx, (name, pred) in enumerate(predictions_tuned.items()):
-        ax = axes[1, idx] if n_models > 1 else axes[1]
-        cm = confusion_matrix(y_test, pred)
-        
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Oranges', ax=ax, cbar=False)
-        model_family = name.replace('_tuned', '')
-        ax.set_title(f'{model_family}\n(TUNED)', fontsize=11, fontweight='bold')
-        ax.set_ylabel('True Label', fontsize=10)
-        ax.set_xlabel('Predicted Label', fontsize=10)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  ✓ {output_path.name}")
-
-
-# ============================================================================
-# BASE VS TUNED - INDIVIDUAL MODEL COMPARISON
-# ============================================================================
-
-def plot_base_vs_tuned_individual(df_results: pd.DataFrame, output_path: Path):
-    """
-    Create individual comparison plots for each model family
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.flatten()
-    
-    # model_families = ['LogisticRegression', 'RandomForest', 'XGBoost'] # 'SVM'
-    # Détection automatique des modèles présents
-    model_families = []
-    for model_name in df_results['model'].unique():
-        if '_base' in model_name:
-            family = model_name.replace('_base', '')
-            if family not in model_families:
-                model_families.append(family)
-    metrics = ['accuracy', 'precision', 'recall', 'f1', 'auc']
-    
-    for idx, family in enumerate(model_families):
-        ax = axes[idx]
-        
-        base_row = df_results[df_results['model'] == f'{family}_base'].iloc[0]
-        tuned_row = df_results[df_results['model'] == f'{family}_tuned'].iloc[0]
-        
-        x = np.arange(len(metrics))
-        width = 0.35
-        
-        base_values = [base_row[m] for m in metrics]
-        tuned_values = [tuned_row[m] for m in metrics]
-        
-        bars1 = ax.bar(x - width/2, base_values, width, label='Base', alpha=0.8, color='skyblue')
-        bars2 = ax.bar(x + width/2, tuned_values, width, label='Tuned', alpha=0.8, color='coral')
-        
-        ax.set_ylabel('Score', fontsize=11, fontweight='bold')
-        ax.set_title(f'{family}: Base vs Tuned', fontsize=12, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels([m.upper() for m in metrics], rotation=15, ha='right', fontsize=9)
-        ax.legend(fontsize=10)
-        ax.grid(axis='y', alpha=0.3)
-        ax.set_ylim([0, 1.05])
-        
-        # Add value labels
-        for bars in [bars1, bars2]:
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{height:.2f}',
-                       ha='center', va='bottom', fontsize=8)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  ✓ {output_path.name}")
-
-
-# ============================================================================
-# YEARLY BACKTEST
-# ============================================================================
-
-def yearly_backtest(
-    df_test: pd.DataFrame,
-    models_base: Dict,
-    models_tuned: Dict,
-    scaler,
-    verbose: bool = True
-) -> pd.DataFrame:
-    """
-    Compute AUC per year for all models
-    """
-    year_col = config.data.year_col
-    target_col = config.data.target_col
-    feature_cols = [f for f in config.data.feature_cols if f in df_test.columns]
-    
-    results = []
-    
-    years = sorted(df_test[year_col].unique())
-    
-    if verbose:
-        logger.info(f"\n--- Yearly Backtest ---")
-        logger.info(f"Years: {years}")
-    
-    for year in years:
-        df_year = df_test[df_test[year_col] == year]
-        
-        if df_year[target_col].nunique() < 2:
-            continue
-        
-        X_year = df_year[feature_cols]
-        y_year = df_year[target_col].astype(int)
-        X_year_scaled = scaler.transform(X_year)
-        
-        row = {
-            'year': int(year),
-            'n_obs': int(len(df_year)),
-            'n_failures': int(y_year.sum())
-        }
-        
-        # Base models
-        for name, model in models_base.items():
-            X = X_year_scaled if 'LogisticRegression' in name or 'SVM' in name else X_year
-            proba = model.predict_proba(X)[:, 1]
-            auc_score = roc_auc_score(y_year, proba)
-            row[f'{name}_auc'] = float(auc_score)
-        
-        # Tuned models
-        for name, model in models_tuned.items():
-            X = X_year_scaled if 'LogisticRegression' in name or 'SVM' in name else X_year
-            proba = model.predict_proba(X)[:, 1]
-            auc_score = roc_auc_score(y_year, proba)
-            row[f'{name}_auc'] = float(auc_score)
-        
-        results.append(row)
-    
-    df_yearly = pd.DataFrame(results)
-    
-    # Save
-    out_path = config.metrics_dir / "yearly_performance.csv"
-    df_yearly.to_csv(out_path, index=False)
-    
-    if verbose:
-        logger.info(f"✓ Yearly backtest complete")
-        logger.info(f"  Saved to: {out_path}")
-    
-    return df_yearly
-
-
-def plot_yearly_performance(df_yearly: pd.DataFrame, output_path: Path):
-    """
-    Plot yearly AUC evolution for all models
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    auc_cols_base = [c for c in df_yearly.columns if '_base_auc' in c]
-    auc_cols_tuned = [c for c in df_yearly.columns if '_tuned_auc' in c]
-    
-    # Base models
-    ax = axes[0]
-    for col in auc_cols_base:
-        model_name = col.replace('_base_auc', '')
-        ax.plot(df_yearly['year'], df_yearly[col], marker='o', linewidth=2, label=model_name)
-    
-    ax.set_xlabel('Year', fontsize=12, fontweight='bold')
-    ax.set_ylabel('AUC', fontsize=12, fontweight='bold')
-    ax.set_title('Yearly AUC Evolution - BASE Models', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.3)
-    ax.set_ylim([0.5, 1.0])
-    
-    # Tuned models
-    ax = axes[1]
-    for col in auc_cols_tuned:
-        model_name = col.replace('_tuned_auc', '')
-        ax.plot(df_yearly['year'], df_yearly[col], marker='o', linewidth=2, label=model_name)
-    
-    ax.set_xlabel('Year', fontsize=12, fontweight='bold')
-    ax.set_ylabel('AUC', fontsize=12, fontweight='bold')
-    ax.set_title('Yearly AUC Evolution - TUNED Models', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.3)
-    ax.set_ylim([0.5, 1.0])
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  ✓ {output_path.name}")
-
-
-# ============================================================================
-# SAVE RESULTS
-# ============================================================================
-
-def save_evaluation_results(df_results: pd.DataFrame, df_yearly: pd.DataFrame):
-    """
-    Save all evaluation results
-    """
-    # Main metrics
-    metrics_path = config.metrics_dir / "model_metrics.csv"
-    df_results.to_csv(metrics_path, index=False)
-    logger.info(f"\n✓ Saved metrics: {metrics_path}")
-    
-    # Yearly performance
-    yearly_path = config.metrics_dir / "yearly_performance.csv"
-    df_yearly.to_csv(yearly_path, index=False)
-    logger.info(f"✓ Saved yearly performance: {yearly_path}")
-
-
-# ============================================================================
-# MAIN PIPELINE
-# ============================================================================
-
-def run_evaluation_pipeline(
-    models_base: Dict,
-    models_tuned: Dict,
-    data: Dict,
-    verbose: bool = True
-) -> Dict:
-    """
-    Complete evaluation pipeline
-    
-    Args:
-        models_base: Base models
-        models_tuned: Tuned models
-        data: Test data dictionary
+        models_base: Dictionary of base models
+        models_tuned: Dictionary of tuned models
+        data: Dictionary from preprocessing pipeline
         verbose: Print progress
+        selected_features: List of feature names used for training (from RFE)
     
     Returns:
-        Dictionary with results
+        Dictionary with evaluation results
     """
-    logger.info("\n" + "="*70)
-    logger.info("MODULE 04: EVALUATION & COMPARISON")
-    logger.info("="*70)
+    if verbose:
+        print("")
+        print("=" * 70)
+        print("MODULE 04: EVALUATION")
+        print("=" * 70)
+    
+    # Combine all models and sort by name: LR_base, LR_tuned, RF_base, RF_tuned, XGB_base, XGB_tuned
+    all_models = {}
+    if models_base:
+        all_models.update(models_base)
+    if models_tuned:
+        all_models.update(models_tuned)
+    
+    # Sort models: by algorithm name first, then base before tuned
+    def model_sort_key(name):
+        # Extract algorithm name and type
+        if 'LogisticRegression' in name:
+            algo = 0
+        elif 'RandomForest' in name:
+            algo = 1
+        elif 'XGBoost' in name:
+            algo = 2
+        else:
+            algo = 3
+        # base=0, tuned=1
+        is_tuned = 1 if 'tuned' in name.lower() else 0
+        return (algo, is_tuned)
+    
+    sorted_model_names = sorted(all_models.keys(), key=model_sort_key)
     
     # Extract data
     X_test = data['X_test']
@@ -630,80 +339,924 @@ def run_evaluation_pipeline(
     df_test = data['df_test']
     scaler = data['scaler']
     
-    # 1. Predictions
-    pred_base, proba_base = predict_all_models(models_base, X_test, X_test_scaled, verbose)
-    pred_tuned, proba_tuned = predict_all_models(models_tuned, X_test, X_test_scaled, verbose)
+    # Step 1: Predictions
+    if verbose:
+        logger.info("--- Making Predictions ---")
+    y_pred, y_proba = predict_all(all_models, X_test, X_test_scaled)
+    if verbose:
+        logger.info(f"Predictions generated for {len(all_models)} models")
     
-    # 2. Metrics
-    df_results = evaluate_all_models(
-        y_test, pred_base, proba_base, pred_tuned, proba_tuned, verbose
-    )
+    # Step 2: Evaluate each model (sorted by name)
+    if verbose:
+        logger.info("--- Evaluating Models ---")
     
-    # 3. Visualizations
-    logger.info("\n--- Generating Visualizations ---")
+    all_metrics = {}
+    for name in sorted_model_names:
+        # Evaluate at threshold=0.5 with calibrated probabilities
+        metrics = evaluate_model(name, y_test, y_pred[name], y_proba[name])
+        all_metrics[name] = metrics
     
-    create_all_comparison_plots(df_results, config.plots_dir)
+    # Step 3: ROC & PR Curves (BASE)
+    if verbose:
+        logger.info("--- Generating ROC & PR Curves (BASE models) ---")
+    plot_roc_pr_curves(y_test, y_proba, all_metrics)
     
-    plot_roc_curves_comparison(
-        y_test, proba_base, proba_tuned,
-        config.plots_dir / "roc_curves_comparison.png"
-    )
+    # Step 3a: ROC & PR Curves (TUNED) - if tuned models exist
+    tuned_exists = any('tuned' in k.lower() for k in y_proba.keys())
+    if tuned_exists:
+        if verbose:
+            logger.info("--- Generating ROC & PR Curves (TUNED models) ---")
+        plot_roc_pr_curves_tuned(y_test, y_proba)
     
-    plot_pr_curves_comparison(
-        y_test, proba_base, proba_tuned,
-        config.plots_dir / "pr_curves_comparison.png"
-    )
+    # Step 3b: Confusion Matrices (BASE + TUNED)
+    if verbose:
+        logger.info("--- Generating Confusion Matrices (BASE + TUNED) ---")
+    plot_confusion_matrices(y_test, y_pred, y_proba)
     
-    plot_confusion_matrices(
-        y_test, pred_base, pred_tuned,
-        config.plots_dir / "confusion_matrices.png"
-    )
+    # Step 3c: Model Comparison Bar Chart (BASE)
+    if verbose:
+        logger.info("--- Generating Model Comparison Plot (BASE models) ---")
+    plot_model_comparison(y_test, y_pred, y_proba)
     
-    plot_base_vs_tuned_individual(
-        df_results,
-        config.plots_dir / "base_vs_tuned_individual.png"
-    )
+    # Step 3d: Model Comparison Bar Chart (TUNED) - if tuned models exist
+    if tuned_exists:
+        if verbose:
+            logger.info("--- Generating Model Comparison Plot (TUNED models) ---")
+        plot_model_comparison_tuned(y_test, y_pred, y_proba)
     
-    # 4. Yearly backtest
-    df_yearly = yearly_backtest(df_test, models_base, models_tuned, scaler, verbose)
+    if verbose:
+        logger.info(f"Curves, matrices and comparison saved to {PLOTS_DIR / 'evaluation'}")
+
     
-    if not df_yearly.empty:
-        plot_yearly_performance(df_yearly, config.plots_dir / "yearly_performance.png")
+    # Step 4: Yearly Backtest
+    if verbose:
+        logger.info("--- Yearly Backtest ---")
+    yearly_df = yearly_backtest(df_test, all_models, scaler, selected_features=selected_features)
+    if verbose:
+        logger.info(f"Yearly performance computed")
     
-    # 5. Save results
-    save_evaluation_results(df_results, df_yearly)
+    # Step 4b: Plot Yearly AUC Stability
+    if verbose:
+        logger.info("--- Plotting Yearly AUC Stability ---")
+    plot_yearly_auc(yearly_df)
     
-    logger.info("\n" + "="*70)
-    logger.info("✅ MODULE 04 COMPLETED")
-    logger.info(f"  Metrics saved: {len(df_results)} models")
-    logger.info(f"  Plots created: {len(list(config.plots_dir.glob('*.png')))}")
-    logger.info("="*70)
+    # Step 5: BASE vs TUNED Comparison (SKIPPED if no tuned models)
+    if verbose:
+        logger.info("--- BASE vs TUNED Model Comparison ---")
+    compare_base_vs_tuned(all_metrics, verbose=verbose)
     
+    # Step 6: Overfitting Analysis (Train vs Test)
+    if verbose:
+        logger.info("")
+        logger.info("="*60)
+        logger.info("OVERFITTING ANALYSIS")
+        logger.info("="*60)
+    df_overfit = compute_overfitting_table(all_models, data, selected_features=selected_features, verbose=verbose)
+    
+    # Step 7: Save results
+    out_metrics = DATA_DIR / "metrics_summary_eval.csv"
+    df_metrics = pd.DataFrame(all_metrics).T
+    df_metrics.to_csv(out_metrics)
+    
+    if verbose:
+        logger.info(f"Metrics saved: {out_metrics}")
+        print("")
+        print("=" * 70)
+        print("MODULE 04 COMPLETED")
+        print("=" * 70)
+    
+    # Return results compatible with main.py
     return {
-        'df_results': df_results,
-        'df_yearly': df_yearly,
-        'predictions_base': pred_base,
-        'probabilities_base': proba_base,
-        'predictions_tuned': pred_tuned,
-        'probabilities_tuned': proba_tuned,
+        'results': all_metrics,
+        'df_results': df_metrics,
+        'df_overfit': df_overfit,
+        'yearly_df': yearly_df,
+        'predictions': y_pred,
+        'probabilities': y_proba
     }
 
 
-if __name__ == "__main__":
-    import pickle
+# -------------------------------------------------------------------
+#  Utilitaires
+# -------------------------------------------------------------------
+def time_based_split(df: pd.DataFrame):
+    """Split temporel train/test basé sur SPLIT_YEAR."""
+    df_train = df[df[YEAR_COL] <= SPLIT_YEAR].copy()
+    df_test = df[df[YEAR_COL] > SPLIT_YEAR].copy()
+
+    X_train = df_train[FEATURE_COLS]
+    y_train = df_train[TARGET_COL].astype(int)
+
+    X_test = df_test[FEATURE_COLS]
+    y_test = df_test[TARGET_COL].astype(int)
+
+    return df_train, df_test, X_train, X_test, y_train, y_test
+
+
+# -------------------------------------------------------------------
+#  Evaluation Functions
+# -------------------------------------------------------------------
+def compare_base_vs_tuned(all_metrics: Dict, verbose: bool = True) -> Dict:
+    """
+    Compare BASE models vs TUNED models
     
-    # Load models
-    with open(config.models_dir / "models_base.pkl", 'rb') as f:
-        models_base = pickle.load(f)
-    with open(config.models_dir / "models_tuned.pkl", 'rb') as f:
-        models_tuned = pickle.load(f)
+    Shows average improvement in key metrics:
+    - Precision (lower is better for FP reduction)
+    - Recall (higher is better for TP capture)
+    - F1-score (balanced metric)
+    - AUC (ranking quality)
     
-    # Load data
-    with open(config.models_dir / "preprocessed_data.pkl", 'rb') as f:
-        data = pickle.load(f)
+    Args:
+        all_metrics: Dictionary with metrics for all models
+        verbose: Print comparison
     
-    # Run evaluation
-    results = run_evaluation_pipeline(models_base, models_tuned, data, verbose=True)
+    Returns:
+        Dictionary with BASE vs TUNED comparison
+    """
+    # Separate BASE and TUNED models
+    base_metrics = {k: v for k, v in all_metrics.items() if 'base' in k.lower()}
+    tuned_metrics = {k: v for k, v in all_metrics.items() if 'tuned' in k.lower()}
     
-    print("\n🎯 Evaluation complete!")
-    print(f"  Best model: {results['df_results'].loc[results['df_results']['auc'].idxmax(), 'model']}")
+    if not base_metrics or not tuned_metrics:
+        if verbose:
+            logger.warning("⚠️  Cannot compare: need both BASE and TUNED models")
+        return {}
+    
+    # Compute averages
+    avg_base = {}
+    avg_tuned = {}
+    
+    for metric_key in ['precision', 'recall', 'f1', 'auc']:
+        base_values = [m.get(metric_key, np.nan) for m in base_metrics.values() if metric_key in m]
+        tuned_values = [m.get(metric_key, np.nan) for m in tuned_metrics.values() if metric_key in m]
+        
+        if base_values:
+            avg_base[metric_key] = np.nanmean(base_values)
+        if tuned_values:
+            avg_tuned[metric_key] = np.nanmean(tuned_values)
+    
+    # Print comparison
+    if verbose:
+        logger.info("")
+        logger.info("="*60)
+        logger.info("BASE vs TUNED MODELS - AVERAGE METRICS COMPARISON")
+        logger.info("="*60)
+        
+        logger.info(f"\nBASE MODELS (Average across {len(base_metrics)} models):")
+        for key, val in avg_base.items():
+            logger.info(f"  {key:20s}: {val:.4f}")
+        
+        logger.info(f"\nTUNED MODELS (Average across {len(tuned_metrics)} models):")
+        for key, val in avg_tuned.items():
+            logger.info(f"  {key:20s}: {val:.4f}")
+        
+        # Show improvement
+        logger.info("\nIMPROVEMENT (TUNED vs BASE):")
+        for key in avg_base.keys():
+            if key in avg_tuned:
+                diff = avg_tuned[key] - avg_base[key]
+                pct_change = (diff / avg_base[key] * 100) if avg_base[key] != 0 else 0
+                
+                # Determine direction (positive = improvement for all metrics)
+                direction = "↑" if diff > 0 else "↓"
+                better = "BETTER" if diff > 0 else "WORSE"
+                
+                logger.info(f"  {key:20s}: {direction} {diff:+.4f} ({pct_change:+.2f}%) [{better}]")
+        
+        logger.info("="*70)
+    
+    return {
+        'base_metrics': avg_base,
+        'tuned_metrics': avg_tuned,
+        'n_base_models': len(base_metrics),
+        'n_tuned_models': len(tuned_metrics),
+    }
+
+
+def predict_all(models, X_test, X_test_scaled):
+    """
+    Generate predictions (y_pred and y_proba) for all models
+    
+    Strategy:
+    - LogisticRegression: Use scaled data (X_test_scaled)
+    - RandomForest & XGBoost: Use raw data (X_test)
+    
+    Handles 3 model types: LogReg, RF, XGBoost
+    
+    Args:
+        models: Dictionary of trained models
+        X_test: Raw test features
+        X_test_scaled: Scaled test features
+    
+    Returns:
+        (y_pred, y_proba): Dictionaries with predictions and probabilities
+    """
+    y_pred = {}
+    y_proba = {}
+
+    for name, model in models.items():
+        try:
+            # Determine data to use based on model type
+            if 'LogisticRegression' in name:
+                # Linear models use scaled data
+                X = X_test_scaled
+            else:
+                # Tree-based models (RF, XGBoost) use raw data
+                X = X_test
+            
+            # sklearn models (LogReg, RF, XGBoost)
+            y_proba_temp = model.predict_proba(X)[:, 1]
+            y_pred_temp = model.predict(X)
+            
+            y_pred[name] = y_pred_temp
+            y_proba[name] = y_proba_temp
+        
+        except Exception as e:
+            logger.warning(f"⚠️  Error generating predictions for {name}: {str(e)}")
+            # Return NaN predictions to indicate error
+            y_pred[name] = np.full(len(X_test), np.nan)
+            y_proba[name] = np.full(len(X_test), np.nan)
+
+    return y_pred, y_proba
+
+
+def evaluate_model(name, y_true, y_pred, y_proba) -> Dict[str, float]:
+    """
+    Model evaluation with probability calibration
+    
+    Note: Uses threshold=0.5 for all models.
+    For custom threshold analysis, use `find_optimal_threshold_f1`
+    and `plot_threshold_analysis` functions.
+    
+    Args:
+        name: Model name
+        y_true: True labels
+        y_pred: Binary predictions at 0.5 threshold
+        y_proba: Probability predictions
+    
+    Returns:
+        Dictionary with metrics
+    """
+    is_base = 'base' in name.lower()
+    is_tuned = 'tuned' in name.lower()
+    
+    logger.info(f"{'='*60}")
+    logger.info(f"MODEL: {name}")
+    logger.info(f"{'='*60}")
+    logger.info(f"Type: {'BASE' if is_base else 'TUNED' if is_tuned else 'UNKNOWN'}")
+
+    # Calibrate probabilities
+    _, y_proba_calibrated = calibrate_probabilities(y_true, y_proba, method='isotonic')
+
+    # Confusion matrix and classification report
+    logger.info("Confusion matrix:")
+    cm = confusion_matrix(y_true, y_pred)
+    # Format without outer brackets
+    logger.info(f" [{cm[0,0]:>5}  {cm[0,1]:>5}]")
+    logger.info(f" [{cm[1,0]:>5}  {cm[1,1]:>5}]")
+    
+    logger.info("Classification report:")
+    logger.info(f"\n{classification_report(y_true, y_pred, digits=4)}")
+    
+    # Metrics
+    f1 = f1_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    auc = roc_auc_score(y_true, y_proba_calibrated)
+    
+    logger.info(f"AUC-ROC: {auc:.4f}")
+
+    return {
+        "model_type": "BASE" if is_base else "TUNED" if is_tuned else "UNKNOWN",
+        "auc": float(auc),
+        "f1": float(f1),
+        "precision": float(prec),
+        "recall": float(rec),
+        "threshold": 0.5,
+    }
+
+    
+
+
+def plot_roc_pr_curves(y_test, proba_dict, all_metrics=None):
+    """
+    Plot ROC and PR curves for BASE models only with distinct colors
+    """
+    # Filter BASE models only
+    base_models = {k: v for k, v in proba_dict.items() if 'base' in k.lower()}
+    
+    if not base_models:
+        logger.warning("No BASE models found for ROC/PR curves")
+        return
+    
+    # Create evaluation subfolder
+    eval_dir = PLOTS_DIR / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Distinct colors for each model
+    colors = {
+        'LogisticRegression_base': '#2ecc71',  # Green
+        'RandomForest_base': '#3498db',         # Blue
+        'XGBoost_base': '#e74c3c',              # Red
+    }
+    
+    # ============ ROC CURVES (BASE ONLY) ============
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    for name, proba in base_models.items():
+        fpr, tpr, _ = roc_curve(y_test, proba)
+        auc_score = roc_auc_score(y_test, proba)
+        color = colors.get(name, 'gray')
+        
+        # Clean name for legend
+        display_name = name.replace('_base', '').replace('_', ' ')
+        ax.plot(fpr, tpr, linewidth=2.5, color=color, 
+                label=f'{display_name} (AUC={auc_score:.3f})')
+    
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, alpha=0.7, label='Random')
+    ax.set_xlabel('False Positive Rate', fontsize=12, fontweight='bold')
+    ax.set_ylabel('True Positive Rate', fontsize=12, fontweight='bold')
+    ax.set_title('ROC Curves - BASE Models Comparison', fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(eval_dir / "roc_curves_base.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # ============ PR CURVES (BASE ONLY) ============
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Calculate baseline (random classifier)
+    baseline = y_test.sum() / len(y_test)
+    
+    for name, proba in base_models.items():
+        precision, recall, _ = precision_recall_curve(y_test, proba)
+        color = colors.get(name, 'gray')
+        
+        # Clean name for legend
+        display_name = name.replace('_base', '').replace('_', ' ')
+        ax.plot(recall, precision, linewidth=2.5, color=color, label=f'{display_name}')
+    
+    ax.axhline(y=baseline, color='gray', linestyle='--', linewidth=1.5, 
+               label=f'Random baseline ({baseline:.2%})')
+    ax.set_xlabel('Recall', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax.set_title('Precision-Recall Curves - BASE Models Comparison', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(eval_dir / "pr_curves_base.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  ✓ ROC/PR curves (BASE) saved to {eval_dir}")
+
+
+def plot_roc_pr_curves_tuned(y_test, proba_dict):
+    """
+    Plot ROC and PR curves for TUNED models only with distinct colors
+    """
+    # Filter TUNED models only
+    tuned_models = {k: v for k, v in proba_dict.items() if 'tuned' in k.lower()}
+    
+    if not tuned_models:
+        logger.warning("No TUNED models found for ROC/PR curves")
+        return
+    
+    # Create evaluation subfolder
+    eval_dir = PLOTS_DIR / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Distinct colors for each model (darker shades for tuned)
+    colors = {
+        'LogisticRegression_tuned': '#1e8449',  # Dark Green
+        'RandomForest_tuned': '#2874a6',         # Dark Blue
+        'XGBoost_tuned': '#c0392b',              # Dark Red
+    }
+    
+    # ============ ROC CURVES (TUNED ONLY) ============
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    for name, proba in tuned_models.items():
+        fpr, tpr, _ = roc_curve(y_test, proba)
+        auc_score = roc_auc_score(y_test, proba)
+        color = colors.get(name, 'gray')
+        
+        # Clean name for legend
+        display_name = name.replace('_tuned', '').replace('_', ' ')
+        ax.plot(fpr, tpr, linewidth=2.5, color=color, 
+                label=f'{display_name} (AUC={auc_score:.3f})')
+    
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, alpha=0.7, label='Random')
+    ax.set_xlabel('False Positive Rate', fontsize=12, fontweight='bold')
+    ax.set_ylabel('True Positive Rate', fontsize=12, fontweight='bold')
+    ax.set_title('ROC Curves - TUNED Models Comparison', fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(eval_dir / "roc_curves_tuned.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # ============ PR CURVES (TUNED ONLY) ============
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Calculate baseline (random classifier)
+    baseline = y_test.sum() / len(y_test)
+    
+    for name, proba in tuned_models.items():
+        precision, recall, _ = precision_recall_curve(y_test, proba)
+        color = colors.get(name, 'gray')
+        
+        # Clean name for legend
+        display_name = name.replace('_tuned', '').replace('_', ' ')
+        ax.plot(recall, precision, linewidth=2.5, color=color, label=f'{display_name}')
+    
+    ax.axhline(y=baseline, color='gray', linestyle='--', linewidth=1.5, 
+               label=f'Random baseline ({baseline:.2%})')
+    ax.set_xlabel('Recall', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax.set_title('Precision-Recall Curves - TUNED Models Comparison', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(eval_dir / "pr_curves_tuned.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  ✓ ROC/PR curves (TUNED) saved to {eval_dir}")
+
+
+def plot_confusion_matrices(y_test, y_pred_dict, y_proba_dict):
+    """
+    Plot clean confusion matrices for ALL models (BASE and TUNED)
+    Each model gets a different color palette - counts only, no percentages
+    """
+    import seaborn as sns
+    
+    # Separate BASE and TUNED models
+    base_models = {k: v for k, v in y_pred_dict.items() if 'base' in k.lower()}
+    tuned_models = {k: v for k, v in y_pred_dict.items() if 'tuned' in k.lower()}
+    
+    if not base_models:
+        logger.warning("No BASE models found for confusion matrices")
+        return
+    
+    # Create evaluation subfolder
+    eval_dir = PLOTS_DIR / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Color palettes for models
+    color_palettes = {
+        'LogisticRegression_base': sns.light_palette("#27ae60", as_cmap=True),   # Green
+        'RandomForest_base': sns.light_palette("#3498db", as_cmap=True),          # Blue
+        'XGBoost_base': sns.light_palette("#e74c3c", as_cmap=True),               # Red
+        'LogisticRegression_tuned': sns.light_palette("#1e8449", as_cmap=True),  # Dark Green
+        'RandomForest_tuned': sns.light_palette("#2874a6", as_cmap=True),         # Dark Blue
+        'XGBoost_tuned': sns.light_palette("#c0392b", as_cmap=True),              # Dark Red
+    }
+    
+    # Determine layout: 2 rows if we have tuned models
+    n_base = len(base_models)
+    n_tuned = len(tuned_models)
+    
+    if n_tuned > 0:
+        # 2 rows: BASE on top, TUNED on bottom
+        n_cols = max(n_base, n_tuned)
+        fig, axes = plt.subplots(2, n_cols, figsize=(5.5*n_cols, 10))
+        
+        # Plot BASE models (row 0)
+        for idx, (name, y_pred) in enumerate(base_models.items()):
+            ax = axes[0, idx] if n_cols > 1 else axes[0]
+            display_name = name.replace('_base', '').replace('_', ' ')
+            cmap = color_palettes.get(name, sns.light_palette("#34495e", as_cmap=True))
+            cm = confusion_matrix(y_test, y_pred)
+            labels = np.array([[f'{val:,}' for val in row] for row in cm])
+            
+            sns.heatmap(cm, annot=labels, fmt='', cmap=cmap, ax=ax,
+                        xticklabels=['Pred: Survive', 'Pred: Bankrupt'],
+                        yticklabels=['True: Survive', 'True: Bankrupt'],
+                        cbar=False, linewidths=3, linecolor='white',
+                        annot_kws={'size': 14, 'weight': 'bold'})
+            ax.set_title(f'{display_name} (BASE)', fontsize=14, fontweight='bold', pad=12)
+            ax.tick_params(axis='both', labelsize=10)
+        
+        # Hide unused axes in row 0
+        for idx in range(n_base, n_cols):
+            if n_cols > 1:
+                fig.delaxes(axes[0, idx])
+        
+        # Plot TUNED models (row 1)
+        for idx, (name, y_pred) in enumerate(tuned_models.items()):
+            ax = axes[1, idx] if n_cols > 1 else axes[1]
+            display_name = name.replace('_tuned', '').replace('_', ' ')
+            cmap = color_palettes.get(name, sns.light_palette("#34495e", as_cmap=True))
+            cm = confusion_matrix(y_test, y_pred)
+            labels = np.array([[f'{val:,}' for val in row] for row in cm])
+            
+            sns.heatmap(cm, annot=labels, fmt='', cmap=cmap, ax=ax,
+                        xticklabels=['Pred: Survive', 'Pred: Bankrupt'],
+                        yticklabels=['True: Survive', 'True: Bankrupt'],
+                        cbar=False, linewidths=3, linecolor='white',
+                        annot_kws={'size': 14, 'weight': 'bold'})
+            ax.set_title(f'{display_name} (TUNED)', fontsize=14, fontweight='bold', pad=12)
+            ax.tick_params(axis='both', labelsize=10)
+        
+        # Hide unused axes in row 1
+        for idx in range(n_tuned, n_cols):
+            if n_cols > 1:
+                fig.delaxes(axes[1, idx])
+        
+        plt.suptitle('Confusion Matrices - BASE vs TUNED Models', fontsize=16, fontweight='bold', y=1.02)
+    else:
+        # Only BASE models - single row
+        n_models = len(base_models)
+        fig, axes = plt.subplots(1, n_models, figsize=(5.5*n_models, 5))
+        
+        if n_models == 1:
+            axes = [axes]
+        
+        for idx, (name, y_pred) in enumerate(base_models.items()):
+            ax = axes[idx]
+            display_name = name.replace('_base', '').replace('_', ' ')
+            cmap = color_palettes.get(name, sns.light_palette("#34495e", as_cmap=True))
+            cm = confusion_matrix(y_test, y_pred)
+            labels = np.array([[f'{val:,}' for val in row] for row in cm])
+            
+            sns.heatmap(cm, annot=labels, fmt='', cmap=cmap, ax=ax,
+                        xticklabels=['Pred: Survive', 'Pred: Bankrupt'],
+                        yticklabels=['True: Survive', 'True: Bankrupt'],
+                        cbar=False, linewidths=3, linecolor='white',
+                        annot_kws={'size': 14, 'weight': 'bold'})
+            ax.set_title(f'{display_name}', fontsize=14, fontweight='bold', pad=12)
+            ax.tick_params(axis='both', labelsize=10)
+        
+        plt.suptitle('Confusion Matrices - BASE Models', fontsize=16, fontweight='bold', y=1.02)
+    
+    plt.tight_layout()
+    plt.savefig(eval_dir / "confusion_matrices.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  ✓ Confusion matrices saved to {eval_dir}")
+
+
+def plot_model_comparison(y_test, y_pred_dict, y_proba_dict):
+    """
+    Plot BASE models performance comparison bar chart
+    X-axis: Performance metrics, Colors: by Model
+    """
+    import seaborn as sns
+    
+    # Filter BASE models only
+    base_models_pred = {k: v for k, v in y_pred_dict.items() if 'base' in k.lower()}
+    base_models_proba = {k: v for k, v in y_proba_dict.items() if 'base' in k.lower()}
+    
+    if not base_models_pred:
+        logger.warning("No BASE models found for comparison plot")
+        return
+    
+    # Create evaluation subfolder
+    eval_dir = PLOTS_DIR / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Compute metrics for each model
+    metrics_data = []
+    for name in base_models_pred.keys():
+        y_pred = base_models_pred[name]
+        y_proba = base_models_proba[name]
+        
+        display_name = name.replace('_base', '').replace('_', ' ')
+        
+        auc = roc_auc_score(y_test, y_proba)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        
+        metrics_data.append({'Model': display_name, 'Metric': 'AUC', 'Value': auc})
+        metrics_data.append({'Model': display_name, 'Metric': 'Precision', 'Value': precision})
+        metrics_data.append({'Model': display_name, 'Metric': 'Recall', 'Value': recall})
+        metrics_data.append({'Model': display_name, 'Metric': 'F1-Score', 'Value': f1})
+    
+    df_metrics = pd.DataFrame(metrics_data)
+    
+    # Create grouped bar chart - X axis = metrics, colors = models
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Color palette for models
+    model_colors = {
+        'LogisticRegression': '#27ae60',  # Green
+        'RandomForest': '#3498db',         # Blue
+        'XGBoost': '#e74c3c',              # Red
+    }
+    
+    # Get unique models and metrics
+    models = df_metrics['Model'].unique()
+    metrics = ['AUC', 'Precision', 'Recall', 'F1-Score']
+    
+    # Plot grouped bars - metrics on X-axis, models as different colors
+    x = np.arange(len(metrics))
+    width = 0.25
+    n_models = len(models)
+    
+    for i, model in enumerate(models):
+        values = [df_metrics[(df_metrics['Model'] == model) & (df_metrics['Metric'] == m)]['Value'].values[0] 
+                  for m in metrics]
+        color = model_colors.get(model, '#34495e')
+        offset = (i - n_models/2 + 0.5) * width
+        bars = ax.bar(x + offset, values, width, label=model, color=color, alpha=0.85, edgecolor='white', linewidth=1)
+        
+        # Add value labels on bars
+        for bar, val in zip(bars, values):
+            height = bar.get_height()
+            ax.annotate(f'{val:.1%}',
+                       xy=(bar.get_x() + bar.get_width()/2, height),
+                       xytext=(0, 3), textcoords="offset points",
+                       ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    # Customize plot
+    ax.set_xlabel('Performance Metric', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Score', fontsize=13, fontweight='bold')
+    ax.set_title('BASE Models - Performance Comparison', fontsize=15, fontweight='bold', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics, fontsize=12, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=11, title='Model', title_fontsize=12)
+    ax.set_ylim(0, 1.15)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add horizontal line at 50%
+    ax.axhline(y=0.5, color='gray', linestyle=':', linewidth=1.5, alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(eval_dir / "model_comparison_base.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  ✓ Model comparison plot (BASE) saved to {eval_dir}")
+
+
+def plot_model_comparison_tuned(y_test, y_pred_dict, y_proba_dict):
+    """
+    Plot TUNED models performance comparison bar chart
+    X-axis: Performance metrics, Colors: by Model
+    """
+    import seaborn as sns
+    
+    # Filter TUNED models only
+    tuned_models_pred = {k: v for k, v in y_pred_dict.items() if 'tuned' in k.lower()}
+    tuned_models_proba = {k: v for k, v in y_proba_dict.items() if 'tuned' in k.lower()}
+    
+    if not tuned_models_pred:
+        logger.warning("No TUNED models found for comparison plot")
+        return
+    
+    # Create evaluation subfolder
+    eval_dir = PLOTS_DIR / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Compute metrics for each model
+    metrics_data = []
+    for name in tuned_models_pred.keys():
+        y_pred = tuned_models_pred[name]
+        y_proba = tuned_models_proba[name]
+        
+        display_name = name.replace('_tuned', '').replace('_', ' ')
+        
+        auc = roc_auc_score(y_test, y_proba)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        
+        metrics_data.append({'Model': display_name, 'Metric': 'AUC', 'Value': auc})
+        metrics_data.append({'Model': display_name, 'Metric': 'Precision', 'Value': precision})
+        metrics_data.append({'Model': display_name, 'Metric': 'Recall', 'Value': recall})
+        metrics_data.append({'Model': display_name, 'Metric': 'F1-Score', 'Value': f1})
+    
+    df_metrics = pd.DataFrame(metrics_data)
+    
+    # Create grouped bar chart - X axis = metrics, colors = models
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Color palette for models (darker shades for tuned)
+    model_colors = {
+        'LogisticRegression': '#1e8449',  # Dark Green
+        'RandomForest': '#2874a6',         # Dark Blue
+        'XGBoost': '#c0392b',              # Dark Red
+    }
+    
+    # Get unique models and metrics
+    models = df_metrics['Model'].unique()
+    metrics = ['AUC', 'Precision', 'Recall', 'F1-Score']
+    
+    # Plot grouped bars - metrics on X-axis, models as different colors
+    x = np.arange(len(metrics))
+    width = 0.25
+    n_models = len(models)
+    
+    for i, model in enumerate(models):
+        values = [df_metrics[(df_metrics['Model'] == model) & (df_metrics['Metric'] == m)]['Value'].values[0] 
+                  for m in metrics]
+        color = model_colors.get(model, '#34495e')
+        offset = (i - n_models/2 + 0.5) * width
+        bars = ax.bar(x + offset, values, width, label=model, color=color, alpha=0.85, edgecolor='white', linewidth=1)
+        
+        # Add value labels on bars
+        for bar, val in zip(bars, values):
+            height = bar.get_height()
+            ax.annotate(f'{val:.1%}',
+                       xy=(bar.get_x() + bar.get_width()/2, height),
+                       xytext=(0, 3), textcoords="offset points",
+                       ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    # Customize plot
+    ax.set_xlabel('Performance Metric', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Score', fontsize=13, fontweight='bold')
+    ax.set_title('TUNED Models - Performance Comparison', fontsize=15, fontweight='bold', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics, fontsize=12, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=11, title='Model', title_fontsize=12)
+    ax.set_ylim(0, 1.15)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add horizontal line at 50%
+    ax.axhline(y=0.5, color='gray', linestyle=':', linewidth=1.5, alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(eval_dir / "model_comparison_tuned.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  ✓ Model comparison plot (TUNED) saved to {eval_dir}")
+
+
+# -------------------------------------------------------------------
+#  YEARLY AUC STABILITY PLOT (All Models in One Chart)
+# -------------------------------------------------------------------
+def plot_yearly_auc(yearly_df, save_path=None):
+    """
+    Plot yearly AUC for all models in one chart to show stability over time.
+    
+    WHY THIS PLOT?
+    - Shows model performance stability across years
+    - Identifies if model degrades over time
+    - Compares BASE vs TUNED consistency
+    
+    Args:
+        yearly_df: DataFrame from yearly_backtest with columns: year, n_obs, n_fail, {model}_auc
+        save_path: Directory to save plot (default: PLOTS_DIR / 'evaluation')
+    """
+    if yearly_df is None or yearly_df.empty:
+        logger.warning("No yearly data available for plotting")
+        return
+    
+    # Get AUC columns
+    auc_cols = [col for col in yearly_df.columns if col.endswith('_auc')]
+    if not auc_cols:
+        logger.warning("No AUC columns found in yearly_df")
+        return
+    
+    # Setup plot
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Color scheme - BASE (solid) vs TUNED (dashed)
+    base_colors = {
+        'LogisticRegression_base': '#3498db',
+        'RandomForest_base': '#2ecc71', 
+        'XGBoost_base': '#e74c3c'
+    }
+    tuned_colors = {
+        'LogisticRegression_tuned': '#2980b9',
+        'RandomForest_tuned': '#27ae60',
+        'XGBoost_tuned': '#c0392b'
+    }
+    
+    years = yearly_df['year'].values
+    
+    # Plot each model
+    for col in auc_cols:
+        model_name = col.replace('_auc', '')
+        auc_values = yearly_df[col].values
+        
+        # Determine style
+        if 'tuned' in model_name.lower():
+            color = tuned_colors.get(model_name, '#9b59b6')
+            linestyle = '--'
+            marker = 's'
+            label = f"{model_name} (TUNED)"
+        else:
+            color = base_colors.get(model_name, '#34495e')
+            linestyle = '-'
+            marker = 'o'
+            label = f"{model_name} (BASE)"
+        
+        # Plot line
+        ax.plot(years, auc_values, 
+                color=color, linestyle=linestyle, marker=marker,
+                linewidth=2.5, markersize=8, label=label, alpha=0.85)
+        
+        # Add value labels
+        for x, y in zip(years, auc_values):
+            if not np.isnan(y):
+                ax.annotate(f'{y:.3f}', (x, y), 
+                           textcoords="offset points", xytext=(0, 8),
+                           ha='center', fontsize=8, alpha=0.8)
+    
+    # Add reference line at 0.5 (random classifier)
+    ax.axhline(y=0.5, color='gray', linestyle=':', linewidth=1.5, alpha=0.7, label='Random (0.5)')
+    
+    # Add sample size annotations at bottom
+    for i, (year, n_obs, n_fail) in enumerate(zip(years, yearly_df['n_obs'], yearly_df['n_fail'])):
+        ax.annotate(f'n={int(n_obs)}\nfail={int(n_fail)}', 
+                   (year, ax.get_ylim()[0] + 0.02),
+                   ha='center', fontsize=7, alpha=0.6)
+    
+    # Customize plot
+    ax.set_xlabel('Year', fontsize=13, fontweight='bold')
+    ax.set_ylabel('AUC Score', fontsize=13, fontweight='bold')
+    ax.set_title('Model Stability Over Time - Yearly AUC Performance\n(Higher = Better, Stable = Consistent)', 
+                fontsize=14, fontweight='bold', pad=15)
+    ax.set_xticks(years)
+    ax.set_xticklabels([int(y) for y in years], rotation=45)
+    ax.set_ylim(0.45, 1.02)
+    ax.legend(loc='lower right', fontsize=10, ncol=2)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Add shaded region for "good" AUC (>0.7)
+    ax.axhspan(0.7, 1.0, alpha=0.1, color='green', label='_Good AUC')
+    ax.axhspan(0.5, 0.7, alpha=0.1, color='orange', label='_Moderate AUC')
+    
+    plt.tight_layout()
+    
+    # Save plot
+    if save_path is None:
+        save_path = PLOTS_DIR / 'evaluation'
+    save_path = Path(save_path)
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    fig.savefig(save_path / "yearly_auc_stability.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"  Yearly AUC stability plot saved to {save_path / 'yearly_auc_stability.png'}")
+    
+    # Print summary statistics
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("YEARLY AUC STABILITY SUMMARY")
+    logger.info("=" * 60)
+    for col in auc_cols:
+        model_name = col.replace('_auc', '')
+        values = yearly_df[col].dropna()
+        if len(values) > 0:
+            logger.info(f"{model_name}:")
+            logger.info(f"  Mean AUC: {values.mean():.4f}")
+            logger.info(f"  Std AUC:  {values.std():.4f} ({'Stable' if values.std() < 0.05 else 'Variable'})")
+            logger.info(f"  Min:      {values.min():.4f} ({int(yearly_df.loc[values.idxmin(), 'year'])})")
+            logger.info(f"  Max:      {values.max():.4f} ({int(yearly_df.loc[values.idxmax(), 'year'])})")
+
+
+def yearly_backtest(df_test, models, scaler, selected_features=None):
+    """
+    Compute AUC per year on the test period.
+    
+    Args:
+        df_test: Test DataFrame
+        models: Dictionary of trained models
+        scaler: Fitted scaler
+        selected_features: List of feature names (from RFE)
+    
+    Returns:
+        DataFrame with yearly AUC for each model
+    """
+    results = []
+    
+    # Use selected features if provided, otherwise all features
+    feature_cols = selected_features if selected_features else FEATURE_COLS
+    
+    for year in sorted(df_test[YEAR_COL].unique()):
+        df_y = df_test[df_test[YEAR_COL] == year]
+        if df_y[TARGET_COL].nunique() < 2:
+            continue
+
+        X_y = df_y[feature_cols]
+        y_y = df_y[TARGET_COL].astype(int)
+        X_y_scaled = scaler.transform(X_y)
+
+        row = {"year": int(year), "n_obs": int(len(df_y)), "n_fail": int(y_y.sum())}
+
+        for name, model in models.items():
+            try:
+                Xx = X_y_scaled if 'LogisticRegression' in name else X_y
+                proba = model.predict_proba(Xx)[:, 1]
+                auc = roc_auc_score(y_y, proba)
+                row[f"{name}_auc"] = float(auc)
+            except Exception as e:
+                logger.warning(f"Error in yearly_backtest for {name}: {e}")
+                row[f"{name}_auc"] = np.nan
+
+        results.append(row)
+
+    res_df = pd.DataFrame(results)
+    res_df.to_csv(DATA_DIR / "yearly_performance.csv", index=False)
+    return res_df
