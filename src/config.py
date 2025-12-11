@@ -157,8 +157,8 @@ class ModelConfig:
     # BASE: Fixed hyperparameters, no tuning
     # NOTE: class_weight is passed dynamically from preprocessing (same as LR/XGB)
     rf_base: Dict[str, Any] = field(default_factory=lambda: {
-        'n_estimators': 300,
-        'max_depth': 10,
+        'n_estimators': 100,
+        'max_depth': 3,
         'min_samples_split': 20,
         'min_samples_leaf': 10,
         'max_features': 'sqrt',
