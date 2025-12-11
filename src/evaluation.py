@@ -37,11 +37,11 @@ logger = logging.getLogger(__name__)
 
 def compute_overfitting_table(all_models, data, selected_features=None, verbose=True):
     """
-    Compare Train vs Test accuracy to detect overfitting
+    Compare Train vs Test accuracy and AUC to detect overfitting
     
     Overfitting indicators:
-    - Large gap between train and test accuracy
-    - Train accuracy near 100% with lower test accuracy
+    - Large gap between train and test accuracy/AUC
+    - Train metrics near 100% with lower test metrics
     
     Args:
         all_models: Dictionary of trained models
@@ -52,7 +52,7 @@ def compute_overfitting_table(all_models, data, selected_features=None, verbose=
     Returns:
         DataFrame with train/test comparison
     """
-    from sklearn.metrics import accuracy_score
+    from sklearn.metrics import accuracy_score, roc_auc_score
     
     X_train = data['X_train']
     X_test = data['X_test']
@@ -80,23 +80,31 @@ def compute_overfitting_table(all_models, data, selected_features=None, verbose=
         
         # Train predictions
         y_pred_train = model.predict(X_tr)
+        y_proba_train = model.predict_proba(X_tr)[:, 1]
         
         # Test predictions
         y_pred_test = model.predict(X_te)
+        y_proba_test = model.predict_proba(X_te)[:, 1]
         
         # Compute metrics
         acc_train = accuracy_score(y_train, y_pred_train)
         acc_test = accuracy_score(y_test, y_pred_test)
+        auc_train = roc_auc_score(y_train, y_proba_train)
+        auc_test = roc_auc_score(y_test, y_proba_test)
         
         # Gaps (positive = overfitting)
         acc_gap = acc_train - acc_test
+        auc_gap = auc_train - auc_test
         
         results.append({
             'Model': name,
             'Acc_Train': acc_train,
             'Acc_Test': acc_test,
             'Acc_Gap': acc_gap,
-            'Overfit': 'YES' if acc_gap > 0.05 else 'NO'
+            'AUC_Train': auc_train,
+            'AUC_Test': auc_test,
+            'AUC_Gap': auc_gap,
+            'Overfit': 'YES' if (acc_gap > 0.05 or auc_gap > 0.05) else 'NO'
         })
     
     df_overfit = pd.DataFrame(results)
@@ -108,13 +116,13 @@ def compute_overfitting_table(all_models, data, selected_features=None, verbose=
     
     if verbose:
         logger.info("")
-        logger.info("-" * 80)
-        logger.info(f"{'Model':<35} {'Acc_Train':>12} {'Acc_Test':>12} {'Gap':>10} {'Overfit':>10}")
-        logger.info("-" * 80)
+        logger.info("-" * 110)
+        logger.info(f"{'Model':<30} {'Acc_Train':>10} {'Acc_Test':>10} {'Acc_Gap':>10} {'AUC_Train':>10} {'AUC_Test':>10} {'AUC_Gap':>10} {'Overfit':>8}")
+        logger.info("-" * 110)
         for _, row in df_overfit.iterrows():
-            logger.info(f"{row.name:<35} {row['Acc_Train']:>12.4f} {row['Acc_Test']:>12.4f} {row['Acc_Gap']:>+10.4f} {row['Overfit']:>10}")
-        logger.info("-" * 80)
-        logger.info("Overfit threshold: Accuracy gap > 5%")
+            logger.info(f"{row.name:<30} {row['Acc_Train']:>10.4f} {row['Acc_Test']:>10.4f} {row['Acc_Gap']:>+10.4f} {row['AUC_Train']:>10.4f} {row['AUC_Test']:>10.4f} {row['AUC_Gap']:>+10.4f} {row['Overfit']:>8}")
+        logger.info("-" * 110)
+        logger.info("Overfit threshold: Accuracy or AUC gap > 5%")
         logger.info(f"Saved: {out_path}")
     
     return df_overfit

@@ -457,175 +457,72 @@ def generate_feature_importance_summary(
     verbose: bool = True
 ) -> pd.DataFrame:
     """
-    Generate a summary table of top features across all models.
-    
-    Uses BOTH Feature Importance AND SHAP values for robust ranking:
-    - Feature Importance: Gini importance (RF, XGBoost) + abs(coef) for LogReg
-    - SHAP: Mean absolute SHAP values (actual prediction impact)
-    
-    Args:
-        models_base: Dictionary of base models
-        models_tuned: Dictionary of tuned models
-        feature_names: List of feature names
-        output_dir: Directory to save outputs
-        X_shap: DataFrame for SHAP computation (optional but recommended)
-        scaler: Scaler for LogReg (optional)
-        top_n: Number of top features to include (default 5)
-        verbose: Print progress
-    
-    Returns:
-        DataFrame with top features summary
+    Generate a summary table of top features using ONLY XGBoost (Base) FI and SHAP.
     """
     if verbose:
         logger.info("\n--- Generating Feature Importance Summary Table ---")
-        logger.info("    Using BOTH Feature Importance AND SHAP values")
-    
-    # Collect importances from all models
-    importance_data = {}
-    shap_data = {}
-    
-    # Helper to extract feature importance
-    def get_importance(model, model_name):
-        if 'LogisticRegression' in model_name:
-            return pd.Series(np.abs(model.coef_[0]), index=feature_names)
-        else:
-            return pd.Series(model.feature_importances_, index=feature_names)
-    
-    # Helper to compute SHAP importance (mean |SHAP|)
-    def get_shap_importance(model, model_name, X_data):
+        logger.info("    Using ONLY XGBoost (Base) Feature Importance AND SHAP values")
+
+    # Get XGBoost (Base) model
+    xgb_base = models_base.get('XGBoost_base')
+    if xgb_base is None:
+        raise ValueError("XGBoost_base model not found in models_base")
+
+    # Feature Importance
+    fi = pd.Series(xgb_base.feature_importances_, index=feature_names)
+
+    # SHAP Importance
+    shap_imp = None
+    if X_shap is not None:
         try:
-            n_sample = min(200, len(X_data))
-            X_sample = X_data.sample(n=n_sample, random_state=42) if len(X_data) > n_sample else X_data
+            n_sample = min(200, len(X_shap))
+            X_sample = X_shap.sample(n=n_sample, random_state=42) if len(X_shap) > n_sample else X_shap
             X_array = X_sample.values.astype(np.float64)
-            
-            if 'XGBoost' in model_name:
-                background = X_array[:min(50, len(X_array))]
-                explainer = shap.Explainer(model.predict_proba, background)
-                shap_vals = explainer(X_array).values[:, :, 1]
-            elif 'LogisticRegression' in model_name:
-                X_scaled = scaler.transform(X_array) if scaler is not None else X_array
-                background = X_scaled[:min(50, len(X_scaled))]
-                explainer = shap.LinearExplainer(model, background)
-                shap_vals = explainer.shap_values(X_scaled)
-            else:  # RandomForest
-                explainer = shap.TreeExplainer(model)
-                shap_vals = explainer.shap_values(X_array)
-                if isinstance(shap_vals, list):
-                    shap_vals = shap_vals[1]
-                elif len(shap_vals.shape) == 3:
-                    shap_vals = shap_vals[:, :, 1]
-            
+            background = X_array[:min(50, len(X_array))]
+            explainer = shap.Explainer(xgb_base.predict_proba, background)
+            shap_vals = explainer(X_array).values[:, :, 1]
             mean_abs_shap = np.abs(shap_vals).mean(axis=0)
-            return pd.Series(mean_abs_shap, index=feature_names)
+            shap_imp = pd.Series(mean_abs_shap, index=feature_names)
         except Exception as e:
             if verbose:
-                logger.warning(f"    SHAP failed for {model_name}: {str(e)[:50]}")
-            return None
-    
-    # Helper to get direction (for LogReg only)
-    def get_direction(model, feature):
-        idx = feature_names.index(feature)
-        coef = model.coef_[0][idx]
-        if coef > 0:
-            return "↑ Risk"
-        else:
-            return "↓ Risk"
-    
-    # Extract Feature Importance from BASE models
-    for name, model in models_base.items():
-        importance_data[f"{name}_FI"] = get_importance(model, name)
-    
-    # Extract Feature Importance from TUNED models
-    if models_tuned:
-        for name, model in models_tuned.items():
-            importance_data[f"{name}_FI"] = get_importance(model, name)
-    
-    # Extract SHAP importance if X_shap provided
-    if X_shap is not None:
-        if verbose:
-            logger.info("    Computing SHAP importances...")
-        
-        for name, model in models_base.items():
-            shap_imp = get_shap_importance(model, name, X_shap)
-            if shap_imp is not None:
-                shap_data[f"{name}_SHAP"] = shap_imp
-        
-        if models_tuned:
-            for name, model in models_tuned.items():
-                shap_imp = get_shap_importance(model, name, X_shap)
-                if shap_imp is not None:
-                    shap_data[f"{name}_SHAP"] = shap_imp
-    
-    # Combine Feature Importance and SHAP data
-    all_data = {**importance_data, **shap_data}
-    df_importance = pd.DataFrame(all_data)
-    
-    # Normalize each column to [0, 1] for fair comparison
-    df_normalized = df_importance.apply(lambda x: x / x.max() if x.max() > 0 else x)
-    
-    # Compute average normalized importance across all models
-    df_normalized['Avg_Importance'] = df_normalized.mean(axis=1)
-    
-    # Rank features (1 = most important)
-    df_normalized['Rank'] = df_normalized['Avg_Importance'].rank(ascending=False).astype(int)
-    
-    # Sort by average importance
-    df_sorted = df_normalized.sort_values('Avg_Importance', ascending=False)
-    
-    # Select top N features
-    top_features = df_sorted.head(top_n).copy()
-    
-    # Get direction from LogReg (base model)
+                logger.warning(f"    SHAP failed for XGBoost_base: {str(e)[:50]}")
+            shap_imp = pd.Series([0]*len(feature_names), index=feature_names)
+    else:
+        shap_imp = pd.Series([0]*len(feature_names), index=feature_names)
+
+    # Combine and rank
+    df = pd.DataFrame({
+        'FI_XGB_Base': fi,
+        'SHAP_XGB_Base': shap_imp
+    })
+    df['FI_XGB_Base'] = df['FI_XGB_Base'].apply(lambda x: f"{x:.4f}")
+    df['SHAP_XGB_Base'] = df['SHAP_XGB_Base'].apply(lambda x: f"{x:.4f}")
+    df['Combined'] = df[['FI_XGB_Base', 'SHAP_XGB_Base']].astype(float).mean(axis=1).apply(lambda x: f"{x:.4f}")
+    df_sorted = df.sort_values('Combined', ascending=False).head(top_n)
+    df_sorted['Rank'] = range(1, top_n + 1)
+
+    # Get direction from LogReg (base model) if available
     if 'LogisticRegression_base' in models_base:
         logreg = models_base['LogisticRegression_base']
-        top_features['Effect'] = [get_direction(logreg, f) for f in top_features.index]
+        def get_direction(feature):
+            idx = feature_names.index(feature)
+            coef = logreg.coef_[0][idx]
+            return "↑ Risk" if coef > 0 else "↓ Risk"
+        df_sorted['Effect'] = [get_direction(f) for f in df_sorted.index]
     else:
-        top_features['Effect'] = "N/A"
-    
-    # Log how many sources used
-    n_fi = len(importance_data)
-    n_shap = len(shap_data)
-    if verbose:
-        logger.info(f"    Sources: {n_fi} Feature Importance + {n_shap} SHAP = {n_fi + n_shap} total")
-    
-    # Create clean summary table for Word documentation
-    # Compute average FI and average SHAP separately for clarity
-    fi_cols = [c for c in top_features.columns if '_FI' in c]
-    shap_cols = [c for c in top_features.columns if '_SHAP' in c]
-    
-    avg_fi = top_features[fi_cols].mean(axis=1).values if fi_cols else [0] * top_n
-    avg_shap = top_features[shap_cols].mean(axis=1).values if shap_cols else [0] * top_n
-    
-    summary_table = pd.DataFrame({
-        'Rank': range(1, top_n + 1),
-        'Feature': top_features.index,
-        'Avg_FI': avg_fi,
-        'Avg_SHAP': avg_shap,
-        'Combined': top_features['Avg_Importance'].values,
-        'Effect': top_features['Effect'].values
-    })
-    
-    # Round numeric columns
-    numeric_cols = ['Avg_FI', 'Avg_SHAP', 'Combined']
-    for col in numeric_cols:
-        if col in summary_table.columns:
-            summary_table[col] = summary_table[col].round(3)
-    
-    # Save to CSV in project data folder
+        df_sorted['Effect'] = "N/A"
+
+    # Save to CSV
     csv_path = config.data_dir / "top_features_summary.csv"
-    summary_table.to_csv(csv_path, index=False)
+    df_sorted[['Rank', 'FI_XGB_Base', 'SHAP_XGB_Base', 'Combined', 'Effect']].to_csv(csv_path, index=True)
     if verbose:
         logger.info(f"✓ Summary table saved: {csv_path}")
-    
-    # Create visual table (PNG)
-    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Visual table (PNG)
+    fig, ax = plt.subplots(figsize=(12, 4))
     ax.axis('off')
-    
-    # Table data
-    cell_text = summary_table.values.tolist()
-    col_labels = summary_table.columns.tolist()
-    
-    # Create table
+    cell_text = df_sorted[['Rank', 'FI_XGB_Base', 'SHAP_XGB_Base', 'Combined', 'Effect']].reset_index().values.tolist()
+    col_labels = ['Feature', 'Rank', 'FI_XGB_Base', 'SHAP_XGB_Base', 'Combined', 'Effect']
     table = ax.table(
         cellText=cell_text,
         colLabels=col_labels,
@@ -675,13 +572,13 @@ def generate_feature_importance_summary(
         logger.info("\n" + "="*80)
         logger.info("TOP FEATURES AFFECTING BANKRUPTCY RISK")
         logger.info("="*80)
-        logger.info(f"\n{summary_table.to_string(index=False)}")
+        logger.info(f"\n{df_sorted[['Rank', 'FI_XGB_Base', 'SHAP_XGB_Base', 'Combined', 'Effect']].to_string(index=True)}")
         logger.info("\n" + "-"*80)
         logger.info("Effect: ↑ Risk = increases bankruptcy probability")
         logger.info("        ↓ Risk = decreases bankruptcy probability")
         logger.info("="*80)
-    
-    return summary_table
+
+    return df_sorted
 
 
 # ============================================================================
