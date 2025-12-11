@@ -169,7 +169,7 @@ class ModelConfig:
     # TUNED: Default hyperparameters before RandomizedSearchCV optimization
     # NOTE: class_weight is passed dynamically from preprocessing (same as LR/XGB)
     rf_tuned: Dict[str, Any] = field(default_factory=lambda: {
-        'n_estimators': 300,
+        'n_estimators': 250,
         'max_depth': 10,
         'min_samples_split': 15,
         'min_samples_leaf': 8,
@@ -181,7 +181,7 @@ class ModelConfig:
     
     rf_param_grid: Dict[str, List] = field(default_factory=lambda: {
         'n_estimators': [150, 250],
-        'max_depth': [5, 8, 10],       
+        'max_depth': [3, 5, 8],       
         'min_samples_split': [10, 20, 30],
         'min_samples_leaf': [5, 10, 15],
     })
