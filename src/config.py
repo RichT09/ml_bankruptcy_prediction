@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Configuration Module - Enhanced for Bankruptcy Prediction
+
+Author: Richard Tschumi
+Institution: HEC Lausanne
 """
 
 from pathlib import Path
@@ -13,9 +16,9 @@ from typing import List, Dict, Any
 # PATHS
 # ============================================================================
 
-BASE_DIR = Path(__file__).resolve().parents[1]  # project-tschumi/
+BASE_DIR = Path(__file__).resolve().parents[1]  # ml_bankruptcy_prediction/
 RAW_DATA_PATH = BASE_DIR / "data" / "us-bkty-final.csv"
-PROJECT_DIR = Path(__file__).resolve().parents[1]  # project-tschumi/
+PROJECT_DIR = Path(__file__).resolve().parents[1]  # ml_bankruptcy_prediction/
 
 DATA_DIR = PROJECT_DIR / "data"
 OUTPUT_DIR = PROJECT_DIR / "outputs"

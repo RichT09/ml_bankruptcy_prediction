@@ -2,17 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Module 04: Model Evaluation
-Business-constrained threshold optimization + calibrated probabilities
 
-Author: Master Finance Student
-HEC Lausanne - Fall 2025
+Author: Richard Tschumi
+Institution: HEC Lausanne
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict
-import pickle
 from pathlib import Path
 import logging
 
@@ -21,163 +19,16 @@ from sklearn.metrics import (
     roc_curve,
     classification_report,
     confusion_matrix,
-    RocCurveDisplay,
-    PrecisionRecallDisplay,
     precision_recall_curve,
     f1_score,
     precision_score,
     recall_score,
 )
-from sklearn.calibration import CalibratedClassifierCV, IsotonicRegression
 
 # Import config and paths
-from .config import config, PLOTS_DIR, DATA_DIR, YEAR_COL, TARGET_COL, FEATURE_COLS, SPLIT_YEAR
+from .config import PLOTS_DIR, DATA_DIR, YEAR_COL, TARGET_COL, FEATURE_COLS, SPLIT_YEAR
 
 logger = logging.getLogger(__name__)
-
-
-# -------------------------------------------------------------------
-#  Probability Calibration
-# -------------------------------------------------------------------
-
-def calibrate_probabilities(y_true, y_proba, method='isotonic'):
-    """
-    Calibrate predicted probabilities using Isotonic Regression or Platt Scaling
-    
-    WHY CALIBRATION?
-    - Raw model probabilities may not reflect true probability of default
-    - Calibration ensures predicted prob ≈ actual prob (e.g., 0.7 pred → 70% actual default)
-    - Better for business decisions
-    
-    ISOTONIC vs PLATT:
-    - Isotonic: More flexible, handles any monotonic relationship (recommended)
-    - Platt: Simple sigmoid, assumes logistic-like relationship
-    
-    For bankruptcy prediction: ISOTONIC is better (handles non-linear calibration)
-    
-    Args:
-        y_true: True labels
-        y_proba: Predicted probabilities (0-1)
-        method: 'isotonic' or 'platt'
-    
-    Returns:
-        calibrator: Fitted calibration model
-        y_proba_calibrated: Calibrated probabilities
-    """
-    if method == 'isotonic':
-        calibrator = IsotonicRegression(out_of_bounds='clip', y_min=0, y_max=1)
-    elif method == 'platt':
-        from sklearn.linear_model import LogisticRegression
-        # Platt scaling: fit logistic regression
-        calibrator = LogisticRegression(max_iter=1000)
-        y_proba_2d = np.column_stack([1 - y_proba, y_proba])
-    else:
-        raise ValueError(f"Unknown method: {method}")
-    
-    if method == 'isotonic':
-        y_proba_calibrated = calibrator.fit_transform(y_proba, y_true)
-    else:  # platt
-        calibrator.fit(y_proba_2d, y_true)
-        y_proba_calibrated = calibrator.predict_proba(y_proba_2d)[:, 1]
-    
-    return calibrator, y_proba_calibrated
-
-
-def apply_calibration(y_proba, calibrator):
-    """Apply fitted calibrator to new probabilities"""
-    if isinstance(calibrator, IsotonicRegression):
-        return calibrator.transform(y_proba)
-    else:  # Platt
-        y_proba_2d = np.column_stack([1 - y_proba, y_proba])
-        return calibrator.predict_proba(y_proba_2d)[:, 1]
-
-
-# -------------------------------------------------------------------
-#  Business-Constrained Threshold Selection
-# -------------------------------------------------------------------
-
-def find_optimal_threshold_f1(y_true, y_proba, verbose=False):
-    """
-    SELECT THRESHOLD THAT MAXIMIZES F1-SCORE
-    
-    Simple and effective: Find the threshold that gives best F1 balance.
-    
-    Args:
-        y_true: True labels
-        y_proba: Predicted probabilities (0-1)
-        verbose: Print details (default False - only show once in pipeline)
-    
-    Returns:
-        optimal_threshold: Best threshold value
-        metrics: Dict with metrics at optimal threshold
-        calibrated_proba: Calibrated probabilities
-        calibrator: Fitted calibrator
-    """
-    # Step 1: Calibrate probabilities
-    calibrator, y_proba_calibrated = calibrate_probabilities(y_true, y_proba, method='isotonic')
-    
-    # Step 2: Compute Precision-Recall curve
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba_calibrated)
-    
-    # Step 3: Compute F1 for each threshold and find max
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
-    best_idx = np.argmax(f1_scores)
-    
-    optimal_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-    
-    # Step 4: Compute metrics at optimal threshold
-    metrics = {
-        'threshold': float(optimal_threshold),
-        'precision': float(precisions[best_idx]),
-        'recall': float(recalls[best_idx]),
-        'f1': float(f1_scores[best_idx]),
-        'method': 'F1-maximizing',
-        'calibrated': True
-    }
-    
-    if verbose:
-        logger.info(f"Optimal Threshold (F1-max): {metrics['threshold']:.4f}")
-        logger.info(f"  Precision: {metrics['precision']:.4f} | Recall: {metrics['recall']:.4f} | F1: {metrics['f1']:.4f}")
-    
-    return optimal_threshold, metrics, y_proba_calibrated, calibrator
-
-
-# -------------------------------------------------------------------
-#  Threshold Visualization
-# -------------------------------------------------------------------
-
-def plot_threshold_analysis(y_true, y_proba, model_name, save_dir):
-    """
-    Plot Precision, Recall, F1 vs threshold
-    """
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
-    
-    best_idx = np.argmax(f1_scores)
-    best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(thresholds, precisions[:-1], label='Precision', linewidth=2, color='blue')
-    plt.plot(thresholds, recalls[:-1], label='Recall', linewidth=2, color='green')
-    plt.plot(thresholds, f1_scores[:-1], label='F1-score', linewidth=2.5, linestyle='--', color='red')
-    
-    plt.axvline(best_threshold, color='darkred', linestyle=':', linewidth=2, 
-                label=f'Optimal threshold = {best_threshold:.4f}')
-    
-    plt.xlabel('Threshold', fontsize=12, fontweight='bold')
-    plt.ylabel('Score', fontsize=12, fontweight='bold')
-    plt.title(f'{model_name} - Metrics vs Decision Threshold', fontsize=14, fontweight='bold')
-    plt.legend(loc='best', fontsize=10)
-    plt.grid(True, alpha=0.3)
-    plt.xlim([0, 1])
-    plt.ylim([0, 1])
-    plt.tight_layout()
-    
-    save_path = save_dir / f"threshold_analysis_{model_name}.png"
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"  Saved: {save_path.name}")
 
 
 # -------------------------------------------------------------------
@@ -186,10 +37,10 @@ def plot_threshold_analysis(y_true, y_proba, model_name, save_dir):
 
 def compute_overfitting_table(all_models, data, selected_features=None, verbose=True):
     """
-    Compare Train vs Test metrics to detect overfitting
+    Compare Train vs Test accuracy to detect overfitting
     
     Overfitting indicators:
-    - Large gap between train and test accuracy/AUC
+    - Large gap between train and test accuracy
     - Train accuracy near 100% with lower test accuracy
     
     Args:
@@ -229,31 +80,23 @@ def compute_overfitting_table(all_models, data, selected_features=None, verbose=
         
         # Train predictions
         y_pred_train = model.predict(X_tr)
-        y_proba_train = model.predict_proba(X_tr)[:, 1]
         
         # Test predictions
         y_pred_test = model.predict(X_te)
-        y_proba_test = model.predict_proba(X_te)[:, 1]
         
         # Compute metrics
         acc_train = accuracy_score(y_train, y_pred_train)
         acc_test = accuracy_score(y_test, y_pred_test)
-        auc_train = roc_auc_score(y_train, y_proba_train)
-        auc_test = roc_auc_score(y_test, y_proba_test)
         
         # Gaps (positive = overfitting)
         acc_gap = acc_train - acc_test
-        auc_gap = auc_train - auc_test
         
         results.append({
             'Model': name,
             'Acc_Train': acc_train,
             'Acc_Test': acc_test,
             'Acc_Gap': acc_gap,
-            'AUC_Train': auc_train,
-            'AUC_Test': auc_test,
-            'AUC_Gap': auc_gap,
-            'Overfit': 'YES' if auc_gap > 0.05 else 'NO'
+            'Overfit': 'YES' if acc_gap > 0.05 else 'NO'
         })
     
     df_overfit = pd.DataFrame(results)
@@ -265,13 +108,13 @@ def compute_overfitting_table(all_models, data, selected_features=None, verbose=
     
     if verbose:
         logger.info("")
-        logger.info("-" * 100)
-        logger.info(f"{'Model':<35} {'Acc_Train':>10} {'Acc_Test':>10} {'Gap':>8} {'AUC_Train':>10} {'AUC_Test':>10} {'Gap':>8} {'Overfit':>8}")
-        logger.info("-" * 100)
+        logger.info("-" * 80)
+        logger.info(f"{'Model':<35} {'Acc_Train':>12} {'Acc_Test':>12} {'Gap':>10} {'Overfit':>10}")
+        logger.info("-" * 80)
         for _, row in df_overfit.iterrows():
-            logger.info(f"{row.name:<35} {row['Acc_Train']:>10.4f} {row['Acc_Test']:>10.4f} {row['Acc_Gap']:>+8.4f} {row['AUC_Train']:>10.4f} {row['AUC_Test']:>10.4f} {row['AUC_Gap']:>+8.4f} {row['Overfit']:>8}")
-        logger.info("-" * 100)
-        logger.info(f"Overfit threshold: AUC gap > 5%")
+            logger.info(f"{row.name:<35} {row['Acc_Train']:>12.4f} {row['Acc_Test']:>12.4f} {row['Acc_Gap']:>+10.4f} {row['Overfit']:>10}")
+        logger.info("-" * 80)
+        logger.info("Overfit threshold: Accuracy gap > 5%")
         logger.info(f"Saved: {out_path}")
     
     return df_overfit
@@ -285,12 +128,9 @@ def run_evaluation_pipeline(models_base, models_tuned, data, verbose=True, selec
     """
     Complete evaluation pipeline - Compatible with main.py
     
-    - Calibrates probabilities (isotonic)
     - Evaluates all models at threshold 0.5
     - Generates ROC/PR curves, confusion matrices, annual backtest
-    
-    Note: The utility function `find_optimal_threshold_f1` is available
-    for manual threshold analysis if needed.
+    - Computes overfitting analysis (train vs test metrics)
     
     Args:
         models_base: Dictionary of base models
@@ -352,7 +192,7 @@ def run_evaluation_pipeline(models_base, models_tuned, data, verbose=True, selec
     
     all_metrics = {}
     for name in sorted_model_names:
-        # Evaluate at threshold=0.5 with calibrated probabilities
+        # Evaluate at threshold=0.5
         metrics = evaluate_model(name, y_test, y_pred[name], y_proba[name])
         all_metrics[name] = metrics
     
@@ -582,11 +422,9 @@ def predict_all(models, X_test, X_test_scaled):
 
 def evaluate_model(name, y_true, y_pred, y_proba) -> Dict[str, float]:
     """
-    Model evaluation with probability calibration
+    Model evaluation using standard metrics.
     
-    Note: Uses threshold=0.5 for all models.
-    For custom threshold analysis, use `find_optimal_threshold_f1`
-    and `plot_threshold_analysis` functions.
+    Uses threshold=0.5 for all models (default sklearn behavior).
     
     Args:
         name: Model name
@@ -605,9 +443,6 @@ def evaluate_model(name, y_true, y_pred, y_proba) -> Dict[str, float]:
     logger.info(f"{'='*60}")
     logger.info(f"Type: {'BASE' if is_base else 'TUNED' if is_tuned else 'UNKNOWN'}")
 
-    # Calibrate probabilities
-    _, y_proba_calibrated = calibrate_probabilities(y_true, y_proba, method='isotonic')
-
     # Confusion matrix and classification report
     logger.info("Confusion matrix:")
     cm = confusion_matrix(y_true, y_pred)
@@ -622,7 +457,7 @@ def evaluate_model(name, y_true, y_pred, y_proba) -> Dict[str, float]:
     f1 = f1_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
-    auc = roc_auc_score(y_true, y_proba_calibrated)
+    auc = roc_auc_score(y_true, y_proba)
     
     logger.info(f"AUC-ROC: {auc:.4f}")
 

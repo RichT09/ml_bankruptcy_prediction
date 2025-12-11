@@ -1,11 +1,9 @@
 """
 Bankruptcy Prediction ML Package
 Master Finance - Advanced Programming
-HEC Lausanne - Fall 2025
 """
 
-__version__ = "1.0.0"
-__author__ = "Master Finance Student"
+__author__ = "Richard Tschumi"
 __institution__ = "HEC Lausanne"
 
 # Import modules for easy access

@@ -4,8 +4,9 @@
 Module 01: Data Loading & Feature Selection
 Handles data I/O, target construction, and feature selection
 
-Author: Master Finance Student
-HEC Lausanne - Fall 2025
+Author: Richard Tschumi
+Institution: HEC Lausanne
+
 """
 
 import pandas as pd

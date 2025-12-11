@@ -16,6 +16,9 @@ MODEL ARCHITECTURE - BASE vs TUNED
 
 BASE models: Conservative, no tuning, original imbalanced data
 TUNED models: Optimized via TimeSeriesSplit CV, SMOTE resampled data
+
+Author: Richard Tschumi
+Institution: HEC Lausanne
 """
 
 import numpy as np

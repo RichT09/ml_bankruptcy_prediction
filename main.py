@@ -3,6 +3,9 @@
 """
 Main Pipeline Orchestrator
 Bankruptcy Prediction - Complete ML Workflow
+
+Author: Richard Tschumi
+Institution: HEC Lausanne
 """
 
 import sys
@@ -23,14 +26,26 @@ from src.models import run_models_pipeline
 from src.evaluation import run_evaluation_pipeline
 from src.eda_interpretation import run_eda_interpretation_pipeline
 
-# Configure root logger to use stdout (captured by TeeOutput)
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S',
-    stream=sys.stdout
-)
+# Logger will be configured after TeeOutput is set up
 logger = logging.getLogger(__name__)
+
+
+def configure_logging():
+    """Configure logging to capture to TeeOutput (call after setup_logging)"""
+    # Remove any existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add new handler pointing to current sys.stdout (which is TeeOutput)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    ))
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
 
 
 # ----------------------------------------------------------------------------
@@ -126,6 +141,8 @@ def run_complete_pipeline(
     if log_output:
         logs_dir = config.metrics_dir  # outputs/logs/
         log_file = setup_logging(logs_dir)
+        # Configure logging AFTER TeeOutput is set up so logger.info() goes to file
+        configure_logging()
     
     start_time = datetime.now()
     

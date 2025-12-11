@@ -4,8 +4,8 @@
 Module 05: EDA & Model Interpretation
 Exploratory Data Analysis + SHAP analysis
 
-Author: Master Finance Student
-HEC Lausanne - Fall 2025
+Author: Richard Tschumi
+Institution: HEC Lausanne
 """
 
 import numpy as np
@@ -611,10 +611,8 @@ def generate_feature_importance_summary(
         if col in summary_table.columns:
             summary_table[col] = summary_table[col].round(3)
     
-    # Save to CSV in data folder
-    data_dir = output_dir.parents[1] / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = data_dir / "top_features_summary.csv"
+    # Save to CSV in project data folder
+    csv_path = config.data_dir / "top_features_summary.csv"
     summary_table.to_csv(csv_path, index=False)
     if verbose:
         logger.info(f"✓ Summary table saved: {csv_path}")

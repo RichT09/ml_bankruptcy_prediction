@@ -1,5 +1,6 @@
 # Bankruptcy Prediction ML Project
 # HEC Lausanne - Master Finance
+# Python >= 3.10 required (tested on 3.13.5)
 
 # Core Data Science
 numpy>=1.24.0

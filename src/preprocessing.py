@@ -3,6 +3,9 @@
 """
 Module 02: Preprocessing
 Data cleaning, train/test split, scaling, and SMOTE resampling
+
+Author: Richard Tschumi
+Institution: HEC Lausanne
 """
 
 import numpy as np
