@@ -57,3 +57,35 @@ python main.py --split-year 2012
 Each model is trained in two variants:
 - **BASE**: Conservative hyperparameters + class weighting
 - **TUNED**: Hyperparameter optimisation via TimeSeriesSplit CV + SMOTE
+
+## Environment Setup
+
+You can set up the Python environment for this project in two ways:
+
+### 1. Using `environment.yml` (Recommended for Conda/Miniconda users)
+
+This ensures full reproducibility and installs all dependencies, including the correct Python version.
+
+```bash
+# Create the environment from the YAML file
+conda env create -f environment.yml
+
+# Activate the environment
+conda activate ml_bankruptcy_prediction
+```
+
+### 2. Using `requirements.txt` (For pip/virtualenv users)
+
+If you prefer pip or do not use Conda, you can install dependencies as follows:
+
+```bash
+# (Optional) Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+- The `environment.yml` file is recommended for full reproducibility, as it pins the Python version and uses the conda-forge channel.
+- The `requirements.txt` file is suitable for standard pip-based workflows.
