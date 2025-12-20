@@ -104,8 +104,7 @@ def compute_class_weights(y_train, fp_weight_multiplier=1.0):
 # ============ SMOTE WITH CONTROLLED RATIO ============
 def apply_smote(X_train, y_train, sampling_strategy=0.15, verbose=True):
     """
-    SMOTE with controlled ratio (not 50/50)
-    
+    Apply SMOTE to training data with controlled minority class ratio.    
     For precision-focused models:
     - sampling_strategy: enerates synthetic minorities 
     - Keeps false positive rate lower than 50/50 balance
@@ -114,7 +113,7 @@ def apply_smote(X_train, y_train, sampling_strategy=0.15, verbose=True):
     Args:
         X_train: Feature matrix
         y_train: Target labels
-        sampling_strategy: Ratio of minority to majority class (default 0.15 = 15%)
+        sampling_strategy: Ratio of minority to majority class
         verbose: Print statistics
     
     Returns:
@@ -126,7 +125,7 @@ def apply_smote(X_train, y_train, sampling_strategy=0.15, verbose=True):
         logger.info(f"Before: {n_before:,} samples | {n_fail_before} failures ({n_fail_before/n_before*100:.2f}%)")
     
     sm = SMOTE(
-        sampling_strategy=sampling_strategy,  # Key parameter: not 'auto' (50/50)
+        sampling_strategy=sampling_strategy,  
         k_neighbors=5,
         random_state=config.RANDOM_STATE
     )

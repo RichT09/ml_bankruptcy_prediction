@@ -155,7 +155,6 @@ class ModelConfig:
     
     # ==================== RANDOM FOREST ====================
     # BASE: Fixed hyperparameters, no tuning
-    # NOTE: class_weight is passed dynamically from preprocessing (same as LR/XGB)
     rf_base: Dict[str, Any] = field(default_factory=lambda: {
         'n_estimators': 100,
         'max_depth': 3,
@@ -167,7 +166,6 @@ class ModelConfig:
     })
     
     # TUNED: Default hyperparameters before RandomizedSearchCV optimization
-    # NOTE: class_weight is passed dynamically from preprocessing (same as LR/XGB)
     rf_tuned: Dict[str, Any] = field(default_factory=lambda: {
         'n_estimators': 250,
         'max_depth': 10,
@@ -199,7 +197,7 @@ class ModelConfig:
         'reg_lambda': 1,
         'gamma': 0,
         'random_state': 42,
-        'n_jobs': -1,
+        'n_jobs': 1,
         'eval_metric': 'logloss',
     })
     
@@ -215,7 +213,7 @@ class ModelConfig:
         'reg_lambda': 1.0,
         'gamma': 0.05,
         'random_state': 42,
-        'n_jobs': -1,
+        'n_jobs': 1,
         'eval_metric': 'logloss',
     })
     
@@ -271,7 +269,7 @@ class Config:
         self.output_dir = OUTPUT_DIR
         self.models_dir = MODELS_DIR
         self.logs_dir = LOGS_DIR
-        self.metrics_dir = LOGS_DIR  # Alias for backward compatibility
+        self.metrics_dir = LOGS_DIR
         self.plots_dir = PLOTS_DIR
         self.reports_dir = REPORTS_DIR
     
@@ -301,7 +299,7 @@ DATA_DIR = config.data_dir
 PLOTS_DIR = config.plots_dir
 MODELS_DIR = config.models_dir
 LOGS_DIR = config.logs_dir
-METRICS_DIR = config.logs_dir  # Alias for backward compatibility
+METRICS_DIR = config.logs_dir 
 REPORTS_DIR = config.reports_dir
 
 # Data

@@ -282,17 +282,31 @@ def fit_models(
             
             # RandomizedSearchCV with TimeSeriesSplit for tuned models
             if is_tuned:
-                rs = RandomizedSearchCV(
-                    model,
-                    config.models.logreg_param_grid,
-                    cv=tscv,  # TimeSeriesSplit instead of random K-fold
-                    scoring='roc_auc',  # AUC is threshold-independent, better for imbalanced data
-                    n_iter=10,
-                    n_jobs=config.models.n_jobs,
-                    random_state=42,
-                    verbose=0
-                )
-                rs.fit(X, y)
+                try:
+                    rs = RandomizedSearchCV(
+                        model,
+                        config.models.logreg_param_grid,
+                        cv=tscv,
+                        scoring='roc_auc',
+                        n_iter=10,
+                        n_jobs=config.models.n_jobs if config.models.n_jobs != 1 else -1,
+                        random_state=42,
+                        verbose=0
+                    )
+                    rs.fit(X, y)
+                except (ModuleNotFoundError, ImportError):
+                    print("Parallel processing failed, retrying with n_jobs=1")
+                    rs = RandomizedSearchCV(
+                        model,
+                        config.models.logreg_param_grid,
+                        cv=tscv,
+                        scoring='roc_auc',
+                        n_iter=10,
+                        n_jobs=1,
+                        random_state=42,
+                        verbose=0
+                    )
+                    rs.fit(X, y)
                 model = rs.best_estimator_
                 models[name] = model
                 if verbose:
@@ -307,34 +321,62 @@ def fit_models(
             
             # RandomizedSearchCV with TimeSeriesSplit for tuned models
             if is_tuned and 'RandomForest' in name:
-                rs = RandomizedSearchCV(
-                    model,
-                    config.models.rf_param_grid,
-                    cv=tscv,  # TimeSeriesSplit instead of random K-fold
-                    scoring='roc_auc',  # AUC is threshold-independent, better for imbalanced data
-                    n_iter=10,
-                    n_jobs=config.models.n_jobs,
-                    random_state=42,
-                    verbose=0
-                )
-                rs.fit(X, y)
+                try:
+                    rs = RandomizedSearchCV(
+                        model,
+                        config.models.rf_param_grid,
+                        cv=tscv,
+                        scoring='roc_auc',
+                        n_iter=10,
+                        n_jobs=config.models.n_jobs if config.models.n_jobs != 1 else -1,
+                        random_state=42,
+                        verbose=0
+                    )
+                    rs.fit(X, y)
+                except (ModuleNotFoundError, ImportError):
+                    print("Parallel processing failed, retrying with n_jobs=1")
+                    rs = RandomizedSearchCV(
+                        model,
+                        config.models.rf_param_grid,
+                        cv=tscv,
+                        scoring='roc_auc',
+                        n_iter=10,
+                        n_jobs=1,
+                        random_state=42,
+                        verbose=0
+                    )
+                    rs.fit(X, y)
                 model = rs.best_estimator_
                 models[name] = model
                 if verbose:
                     logger.info(f"  → TimeSeriesCV best params: {rs.best_params_}")
                     logger.info(f"  → TimeSeriesCV best AUC: {rs.best_score_:.4f}")
             elif is_tuned and 'XGBoost' in name:
-                rs = RandomizedSearchCV(
-                    model,
-                    config.models.xgb_param_grid,
-                    cv=tscv,  # TimeSeriesSplit instead of random K-fold
-                    scoring='roc_auc',  # AUC is threshold-independent, better for imbalanced data
-                    n_iter=10,
-                    n_jobs=config.models.n_jobs,
-                    random_state=42,
-                    verbose=0
-                )
-                rs.fit(X, y)
+                try:
+                    rs = RandomizedSearchCV(
+                        model,
+                        config.models.xgb_param_grid,
+                        cv=tscv,
+                        scoring='roc_auc',
+                        n_iter=10,
+                        n_jobs=config.models.n_jobs if config.models.n_jobs != 1 else -1,
+                        random_state=42,
+                        verbose=0
+                    )
+                    rs.fit(X, y)
+                except (ModuleNotFoundError, ImportError):
+                    print("Parallel processing failed, retrying with n_jobs=1")
+                    rs = RandomizedSearchCV(
+                        model,
+                        config.models.xgb_param_grid,
+                        cv=tscv,
+                        scoring='roc_auc',
+                        n_iter=10,
+                        n_jobs=1,
+                        random_state=42,
+                        verbose=0
+                    )
+                    rs.fit(X, y)
                 model = rs.best_estimator_
                 models[name] = model
                 if verbose:
