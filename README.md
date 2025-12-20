@@ -1,6 +1,6 @@
 # ML Bankruptcy Prediction
 
-Bankruptcy Prediction using Machine Learning - Master Finance Thesis Project
+Bankruptcy Prediction Using Machine Learning
 
 **Author:** Richard Tschumi  
 **Institution:** HEC Lausanne  
@@ -8,7 +8,7 @@ Bankruptcy Prediction using Machine Learning - Master Finance Thesis Project
 
 ## Overview
 
-This project implements a complete machine learning pipeline for predicting corporate bankruptcy using financial ratios derived from Compustat data.
+This project implements a complete machine learning pipeline for predicting corporate bankruptcy using financial statements derived from Compustat data.
 
 ## Project Structure
 
@@ -16,6 +16,7 @@ This project implements a complete machine learning pipeline for predicting corp
 ml_bankruptcy_prediction/
 ├── main.py                     # Pipeline orchestrator
 ├── requirements.txt            # Python dependencies
+├── environment.yml             # Conda environment specification
 ├── data/                       # Input data and intermediate outputs
 │   └── us-bkty-final.csv       # Raw Compustat dataset
 ├── outputs/
@@ -50,7 +51,7 @@ python main.py --split-year 2012
 
 ## Models
 
-- Logistic Regression (L2 regularised)
+- Logistic Regression
 - Random Forest
 - XGBoost
 

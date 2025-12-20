@@ -1,4 +1,4 @@
-name: bankruptcy-ml
+name: ml_bankruptcy_prediction
 channels:
   - conda-forge
 dependencies:
