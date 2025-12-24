@@ -26,7 +26,10 @@ from sklearn.metrics import (
 )
 
 # Import config and paths
-from .config import PLOTS_DIR, DATA_DIR, YEAR_COL, TARGET_COL, FEATURE_COLS, SPLIT_YEAR
+try:
+    from .config import PLOTS_DIR, DATA_DIR, YEAR_COL, TARGET_COL, FEATURE_COLS, SPLIT_YEAR
+except ImportError:
+    from config import PLOTS_DIR, DATA_DIR, YEAR_COL, TARGET_COL, FEATURE_COLS, SPLIT_YEAR
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +189,16 @@ def run_evaluation_pipeline(models_base, models_tuned, data, verbose=True, selec
     y_test = data['y_test']
     df_test = data['df_test']
     scaler = data['scaler']
-    
+
+    # Apply feature selection to test data if selected_features is provided
+    if selected_features is not None:
+        if hasattr(X_test, 'columns'):
+            X_test = X_test[selected_features]
+        if hasattr(X_test_scaled, 'shape') and hasattr(X_test, 'columns'):
+            # X_test_scaled is numpy, X_test is DataFrame
+            feature_indices = [X_test.columns.get_loc(col) for col in selected_features]
+            X_test_scaled = X_test_scaled[:, feature_indices]
+
     # Step 1: Predictions
     if verbose:
         logger.info("--- Making Predictions ---")
@@ -796,7 +808,7 @@ def plot_model_comparison(y_test, y_pred_dict, y_proba_dict):
     
     # Get unique models and metrics
     models = df_metrics['Model'].unique()
-    metrics = ['AUC', 'Precision', 'Recall', 'F1-Score']
+    metrics = ['AUC', 'Precision', 'Recall', 'F1-Score'];
     
     # Plot grouped bars - metrics on X-axis, models as different colors
     x = np.arange(len(metrics))
@@ -889,7 +901,7 @@ def plot_model_comparison_tuned(y_test, y_pred_dict, y_proba_dict):
     
     # Get unique models and metrics
     models = df_metrics['Model'].unique()
-    metrics = ['AUC', 'Precision', 'Recall', 'F1-Score']
+    metrics = ['AUC', 'Precision', 'Recall', 'F1-Score'];
     
     # Plot grouped bars - metrics on X-axis, models as different colors
     x = np.arange(len(metrics))
@@ -1073,13 +1085,19 @@ def yearly_backtest(df_test, models, scaler, selected_features=None):
     
     # Use selected features if provided, otherwise all features
     feature_cols = selected_features if selected_features else FEATURE_COLS
-    
+
     for year in sorted(df_test[YEAR_COL].unique()):
         df_y = df_test[df_test[YEAR_COL] == year]
         if df_y[TARGET_COL].nunique() < 2:
             continue
 
-        X_y = df_y[feature_cols]
+        # Robust feature alignment for scaler
+        scaler_features = getattr(scaler, 'feature_names_in_', feature_cols)
+        X_y = df_y.reindex(columns=scaler_features)
+        missing_cols = set(scaler_features) - set(X_y.columns)
+        for col in missing_cols:
+            X_y[col] = np.nan
+        X_y = X_y[scaler_features]  # Ensure correct order
         y_y = df_y[TARGET_COL].astype(int)
         X_y_scaled = scaler.transform(X_y)
 
@@ -1100,3 +1118,48 @@ def yearly_backtest(df_test, models, scaler, selected_features=None):
     res_df = pd.DataFrame(results)
     res_df.to_csv(DATA_DIR / "yearly_performance.csv", index=False)
     return res_df
+
+
+# -------------------------------------------------------------------
+#  MAIN EXECUTION BLOCK
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    import pickle
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
+    # Load models and data
+    try:
+        with open(DATA_DIR / "../outputs/models/models_base.pkl", "rb") as f:
+            models_base = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading base models: {e}")
+        models_base = None
+    try:
+        with open(DATA_DIR / "../outputs/models/models_tuned.pkl", "rb") as f:
+            models_tuned = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading tuned models: {e}")
+        models_tuned = None
+    try:
+        with open(DATA_DIR / "../outputs/models/metadata.pkl", "rb") as f:
+            metadata = pickle.load(f)
+            selected_features = metadata.get('selected_features', None)
+    except Exception as e:
+        print(f"Error loading metadata: {e}")
+        selected_features = None
+    try:
+        with open(DATA_DIR / "../outputs/models/preprocessed_data.pkl", "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading preprocessed data: {e}")
+        data = None
+    
+    if models_base is not None and data is not None:
+        run_evaluation_pipeline(models_base, models_tuned, data, verbose=True, selected_features=selected_features)
+    else:
+        print("Required models or data not found. Please run model training first.")

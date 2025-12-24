@@ -27,7 +27,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 try:
     from src.config import config
 except ImportError:
-    import config
+    import config as config_module
+    config = config_module.config
 
 # Plot settings
 sns.set_style("whitegrid")
