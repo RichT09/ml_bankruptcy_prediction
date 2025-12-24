@@ -82,10 +82,9 @@ ml_bankruptcy_prediction/
 ```
 
 ## Restults
-INFO - ============================================================
-INFO - TOP FEATURES AFFECTING BANKRUPTCY RISK
-INFO - ============================================================
-INFO - 
+```
+TOP FEATURES AFFECTING BANKRUPTCY RISK
+
                     Rank FI_XGB_Base SHAP_XGB_Base Combined  Effect
 int_coverage           1      0.1614        0.0174   0.0894  ↓ Risk
 roa_approx             2      0.1357        0.0249   0.0803  ↑ Risk
@@ -105,3 +104,4 @@ Best Models by AUC:
   Best BASE:  XGBoost_base                   AUC = 0.9248
   Best TUNED: XGBoost_tuned                  AUC = 0.9085
   Improvement: -1.63% points
+```
