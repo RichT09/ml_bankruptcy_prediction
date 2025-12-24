@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Module 02: Preprocessing
-Data cleaning, train/test split, scaling, and SMOTE resampling
+Data cleaning, train/test split, scaling and SMOTE resampling
 
 Author: Richard Tschumi
 Institution: HEC Lausanne
@@ -104,9 +104,9 @@ def compute_class_weights(y_train, fp_weight_multiplier=1.0):
 # ============ SMOTE WITH CONTROLLED RATIO ============
 def apply_smote(X_train, y_train, sampling_strategy=0.15, verbose=True):
     """
-    Apply SMOTE to training data with controlled minority class ratio.    
+    Apply SMOTE to training data with controlled minority class ratio.
     For precision-focused models:
-    - sampling_strategy: enerates synthetic minorities 
+    - sampling_strategy: generates synthetic minorities
     - Keeps false positive rate lower than 50/50 balance
     - Better precision while maintaining some recall
     
@@ -222,7 +222,7 @@ def run_preprocessing_pipeline(df, verbose=True):
     """
     Complete preprocessing pipeline -
     
-    Strategy for improving precision :
+    Strategy for improving precision:
     1. Clean features + handle outliers
     2. Split by time
     3. Scale features

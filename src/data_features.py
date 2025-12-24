@@ -185,10 +185,10 @@ def impute_missing_data(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     Impute missing financial data using forward-fill within company, then median
     
     Strategy:
-    1. Forward-fill within each company (by fyear)
-    2. For "active" companies: DROP rows with remaining NaN in critical features
-    3. For "failure" companies: Fill remaining NaN with median (across all companies)
-    4. Backward-fill for companies with NaN at the start
+        1. Forward-fill within each company (by fyear)
+        2. For "active" companies: DROP rows with remaining NaN in critical features
+        3. For "failure" companies: Fill remaining NaN with median (across all companies)
+        4. Backward-fill for companies with NaN at the start
     
     Args:
         df: DataFrame with financial data and status column

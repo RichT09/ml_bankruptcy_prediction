@@ -285,10 +285,10 @@ def run_evaluation_pipeline(models_base, models_tuned, data, verbose=True, selec
 
 
 # -------------------------------------------------------------------
-#  Utilitaires
+#  Utilities
 # -------------------------------------------------------------------
 def time_based_split(df: pd.DataFrame):
-    """Split temporel train/test basé sur SPLIT_YEAR."""
+    """Time-based train/test split using SPLIT_YEAR."""
     df_train = df[df[YEAR_COL] <= SPLIT_YEAR].copy()
     df_test = df[df[YEAR_COL] > SPLIT_YEAR].copy()
 
@@ -477,9 +477,6 @@ def evaluate_model(name, y_true, y_pred, y_proba) -> Dict[str, float]:
         "recall": float(rec),
         "threshold": 0.5,
     }
-
-    
-
 
 def plot_roc_pr_curves(y_test, proba_dict, all_metrics=None):
     """

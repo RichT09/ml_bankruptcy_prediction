@@ -60,7 +60,6 @@ def select_features_rfe(
     """
     Recursive Feature Elimination using XGBoost
     
-    WHY RFE?
     - Removes redundant/correlated features
     - Reduces overfitting risk
     - Faster training

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Module 05: EDA & Model Interpretation
-Exploratory Data Analysis + SHAP analysis
+Exploratory Data Analysis
 
 Author: Richard Tschumi
 Institution: HEC Lausanne
@@ -33,18 +33,17 @@ except ImportError:
 sns.set_style("whitegrid")
 plt.rcParams['figure.dpi'] = config.evaluation.figure_dpi
 
-
 # ============================================================================
 # EXPLORATORY DATA ANALYSIS
 # ============================================================================
 
 def plot_target_distribution(df: pd.DataFrame, output_path: Path):
     """
-    Plot target variable distribution (BAR CHART SEULEMENT)
+    Plot target distribution
     """
     target_col = config.data.target_col
     
-    # Une seule figure avec bar chart
+    # Figure with bar chart
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Count plot
@@ -56,7 +55,7 @@ def plot_target_distribution(df: pd.DataFrame, output_path: Path):
     ax.set_xlabel('Status', fontsize=13, fontweight='bold')
     ax.set_title('Target Distribution', fontsize=16, fontweight='bold', pad=20)
     
-    # Ajouter les valeurs au-dessus des barres
+    # add value labels on bars
     for i, (bar, v) in enumerate(zip(bars, counts.values)):
         percentage = v / counts.sum() * 100
         ax.text(
@@ -73,7 +72,7 @@ def plot_target_distribution(df: pd.DataFrame, output_path: Path):
     ax.grid(axis='y', alpha=0.3, linestyle='--')
     ax.set_axisbelow(True)
     
-    # Format des nombres sur l'axe Y
+    # Format y-axis with commas
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
     
     plt.tight_layout()
@@ -121,7 +120,7 @@ def plot_temporal_distribution(df: pd.DataFrame, output_path: Path):
 
 def plot_correlation_heatmap(df: pd.DataFrame, output_path: Path, selected_features: list = None):
     """
-    Plot correlation heatmap - Version triangulaire
+    Plot correlation heatmap
     Uses RFE selected features if provided, otherwise uses config.data.feature_cols
     """
     if selected_features is not None:
@@ -256,18 +255,18 @@ def prepare_shap_data(df: pd.DataFrame, selected_features: list) -> pd.DataFrame
     Returns:
         DataFrame with only the required numeric features (float64)
     """
-    # Sélectionner uniquement les features existantes
+    # Select only the features needed for SHAP
     available_features = [f for f in selected_features if f in df.columns]
     X = df[available_features].copy()
     
-    # Convertir toutes les colonnes en numérique (gère les strings scientifiques)
+    # Convert all columns to numeric (float64), coercing errors to NaN
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors='coerce')
     
-    # Remplacer NaN par 0
+    # Fill NaNs with 0
     X = X.fillna(0)
     
-    # S'assurer que tout est en float64
+    # Ensure float64 dtype
     X = X.astype(np.float64)
     
     return X
@@ -281,21 +280,21 @@ def shap_summary_tree_model(
     verbose: bool = True
 ):
     """
-    SHAP Summary Plot pour modèles tree-based (RF, XGBoost).
-    Génère UN SEUL plot (beeswarm summary).
+    SHAP Summary Plot for tree-based models (RF, XGBoost).
+    Generates ONLY ONE plot (beeswarm summary).
     """
     if verbose:
         logger.info(f"\n  → SHAP Summary: {model_name}")
     
     try:
-        # Limiter l'échantillon pour la vitesse
+        # Limit the sample for speed
         n_sample = min(500, len(X_shap))
         if len(X_shap) > n_sample:
             X_sample = X_shap.sample(n=n_sample, random_state=42)
         else:
             X_sample = X_shap.copy()
         
-        # Convertir en numpy array float64 (CRITICAL)
+        # Convert to numpy array float64 (CRITICAL)
         X_array = X_sample.values.astype(np.float64)
         feature_names = list(X_sample.columns)
         
@@ -355,32 +354,32 @@ def shap_summary_linear_model(
     verbose: bool = True
 ):
     """
-    SHAP Summary Plot pour Logistic Regression.
-    Applique le scaler si fourni (IMPORTANT: LogReg a été entraîné sur données scalées).
-    Génère UN SEUL plot (beeswarm summary).
+    SHAP Summary Plot for Logistic Regression.
+    Applies the scaler if provided (IMPORTANT: LogReg was trained on scaled data).
+    Generates ONLY ONE plot (beeswarm summary).
     """
     if verbose:
         logger.info(f"\n  → SHAP Summary: {model_name}")
     
     try:
-        # Limiter l'échantillon
+        # Limit the sample
         n_sample = min(500, len(X_shap))
         if len(X_shap) > n_sample:
             X_sample = X_shap.sample(n=n_sample, random_state=42)
         else:
             X_sample = X_shap.copy()
         
-        # Convertir en numpy array float64
+        # Convert to numpy array float64
         X_array = X_sample.values.astype(np.float64)
         feature_names = list(X_sample.columns)
         
-        # Appliquer le scaler si fourni (IMPORTANT pour LogReg)
+        # Apply the scaler if provided (IMPORTANT for LogReg)
         if scaler is not None:
             X_scaled = scaler.transform(X_array)
         else:
             X_scaled = X_array
         
-        # Background data pour LinearExplainer
+        # Background data for LinearExplainer
         n_background = min(100, len(X_scaled))
         background = X_scaled[:n_background]
         
@@ -418,7 +417,7 @@ def _plot_importance_fallback(
     verbose: bool = True
 ):
     """
-    Fallback: feature importance quand SHAP échoue
+    Fallback: feature importance when SHAP fails
     """
     try:
         importances = pd.Series(
@@ -796,18 +795,18 @@ def run_eda_interpretation_pipeline(
     if verbose:
         logger.info(f"\n→ Using {len(feature_cols)} features for SHAP analysis")
     
-    # Échantillonner le dataset
+    # Sample the dataset
     n_sample = min(config.evaluation.shap_sample_size, len(df))
     df_sample = df.sample(n=n_sample, random_state=config.models.random_state)
     
-    # Préparer les données SHAP (conversion numérique avec prepare_shap_data)
+    # Prepare SHAP data (numeric conversion with prepare_shap_data)
     X_shap = prepare_shap_data(df_sample, feature_cols)
     
     if verbose:
         logger.info(f"→ SHAP sample: {X_shap.shape[0]} rows × {X_shap.shape[1]} features")
         logger.info(f"→ Features: {list(X_shap.columns)[:5]}...\n showing first 5")
     
-    # 3. Interpretation (BASE + TUNED models) avec scaler pour LogReg
+    # 3. Interpretation (BASE + TUNED models) with scaler for LogReg
     run_interpretation_pipeline(models_base, X_shap, config.plots_dir, verbose, scaler, models_tuned)
     
     print("")
